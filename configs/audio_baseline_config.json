@@ -1,0 +1,23 @@
+{
+    "sample_rate": 16000,
+    "window_seconds": 2.56,
+    "n_fft": 1024,
+    "hop_length": 160,
+    "n_mels": 128,
+    "fmin": 20,
+    "fmax": 8000,
+    "cqt_fmin": 65.4,
+    "cqt_bins": 128,
+    "cqt_bins_per_octave": 24,
+    "target_time_frames": 257,
+    "input_channels": 2,
+    "num_classes": 2,
+    "label_mapping": {
+        "authentic": 0,
+        "manipulated": 1
+    },
+    "model": "AEGISAudioClassifier",
+    "optimizer": "Adam",
+    "learning_rate": 0.001,
+    "loss": "CrossEntropyLoss"
+}

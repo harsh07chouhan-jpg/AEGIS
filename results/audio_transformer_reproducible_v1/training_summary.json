@@ -1,0 +1,22 @@
+{
+  "epoch": 5,
+  "train_loss": 0.47575232745041934,
+  "learning_rate": 0.0003,
+  "val_loss": 0.2226024100817779,
+  "val_accuracy": 0.9123835557313958,
+  "val_balanced_accuracy": 0.7322942042529266,
+  "val_spoof_precision": 0.9446374294398611,
+  "val_spoof_recall": 0.9586003845537574,
+  "val_spoof_f1": 0.951567687933674,
+  "val_confusion_matrix": [
+    [
+      2873,
+      2805
+    ],
+    [
+      2067,
+      47861
+    ]
+  ],
+  "val_examples": 55606
+}

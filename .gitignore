@@ -1,9 +1,16 @@
+# ==============================
+# AEGIS - Git Ignore
+# ==============================
+
 # Python
 __pycache__/
 *.py[cod]
 *.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Virtual environment
+# Virtual environments
 .venv/
 venv/
 env/
@@ -11,22 +18,32 @@ env/
 # Jupyter
 .ipynb_checkpoints/
 
-# Data
+# Datasets - exclude large raw and processed data
 data/raw/
 data/processed/
+data/audio_dev/raw/
+data/audio_dev/processed/
+*.flac
+*.wav
 
-# Model checkpoints
+# Model checkpoints and weights
 models/checkpoints/
 *.pt
 *.pth
 *.ckpt
 *.safetensors
+*.onnx
 
 # Experiment outputs
 results/tmp/
 results/cache/
 
-# Environment and secrets
+# Frontend dependencies and builds
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Environment variables and secrets
 .env
 .env.*
 !.env.example
@@ -35,7 +52,7 @@ results/cache/
 .vscode/
 .idea/
 
-# OS
+# Operating system
 .DS_Store
 Thumbs.db
 
@@ -50,3 +67,21 @@ dist/
 # Temporary files
 *.tmp
 *.temp
+
+# AEGIS additional exclusions
+data/audio_dev/processed/
+colab_transfer/data/
+results/live_validation_100/ground_truth_key.csv
+
+# Unused temporary root file
+/dir
+
+# Large/generated evaluation outputs
+results/*/eval/*predictions*.csv
+results/audio_transformer_validation_corrected/dev_window_predictions.csv
+results/live_validation_100/
+
+# Colab experiment outputs (keep source, configs and documentation)
+colab_transfer/results/
+
+results/audio_transformer_eval/*predictions*.csv

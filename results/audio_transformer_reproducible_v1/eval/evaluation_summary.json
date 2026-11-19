@@ -1,0 +1,27 @@
+{
+  "checkpoint_sha256": "B937B6BB5C95650D361F75FB9FBE4E8BFFC010070F2853D91E36C64D9D8FD7A4",
+  "checkpoint_epoch": 5,
+  "metadata_utterances": 71237,
+  "prediction_rows": 71237,
+  "failure_rows": 0,
+  "unresolved_rows": 0,
+  "unknown_result_ids": 0,
+  "elapsed_minutes_this_run": 1345.26,
+  "accuracy": 0.890351923859792,
+  "balanced_accuracy": 0.7473935511325043,
+  "spoof_precision": 0.9490206127776799,
+  "spoof_recall": 0.9275539275539275,
+  "spoof_f1": 0.9381644883192553,
+  "confusion_matrix_labels_bonafide_spoof": [
+    [
+      4172,
+      3183
+    ],
+    [
+      4628,
+      59254
+    ]
+  ],
+  "roc_auc": 0.8845935894594578,
+  "eer_approx": 0.1908946976954089
+}

@@ -1,0 +1,114 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,400;0,500;1,400&family=Inter:wght@400;450;500;550;600;700&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;0,6..72,700;1,6..72,400&display=swap');
+
+:root {
+  --font-serif: "Newsreader", "Georgia", "Times New Roman", serif;
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "DM Mono", "Consolas", monospace;
+
+  /* Editorial Warm Off-White Palette */
+  --bg-page: #FAF8F5;
+  --bg-surface: #FFFFFF;
+  --bg-surface-tint: #F3EFE8;
+  --bg-surface-sunken: #ECE6DC;
+
+  /* Typography */
+  --text-primary: #15171B;
+  --text-secondary: #525866;
+  --text-muted: #7E8594;
+  --text-subtle: #A3AAB8;
+
+  /* Hairline Rules */
+  --border-light: #E6E1D8;
+  --border-medium: #D5CEBF;
+  --border-dark: #15171B;
+
+  /* Restrained Accents */
+  --accent-vermilion: #B83A24;
+  --accent-vermilion-soft: #FBF1EF;
+  --accent-forest: #235C33;
+  --accent-forest-soft: #EFF7F1;
+  --accent-ochre: #8F5E15;
+  --accent-ochre-soft: #FDF8ED;
+
+  font-family: var(--font-sans);
+  color: var(--text-primary);
+  background: var(--bg-page);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-width: 320px;
+  min-height: 100%;
+  background: var(--bg-page);
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  color: var(--text-primary);
+  background: var(--bg-page);
+}
+
+button,
+input {
+  font-family: var(--font-sans);
+}
+
+button {
+  -webkit-tap-highlight-color: transparent;
+}
+
+button:focus-visible,
+[role="button"]:focus-visible,
+a:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--text-primary);
+  outline-offset: 3px;
+}
+
+::selection {
+  background: #EAE3D2;
+  color: #15171B;
+}
+
+code,
+pre,
+kbd {
+  font-family: var(--font-mono);
+}
+
+img,
+svg {
+  display: block;
+}
+
+h1,
+h2,
+h3,
+h4,
+p {
+  overflow-wrap: break-word;
+  margin: 0;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "checkpoint_path": "models\\audio_transformer_reproducible_v1\\best_audio_transformer.pt",
+  "checkpoint_sha256": "B937B6BB5C95650D361F75FB9FBE4E8BFFC010070F2853D91E36C64D9D8FD7A4",
+  "metadata_path": "data\\audio_dev\\processed\\asvspoof2019_la_eval_metadata.csv",
+  "metadata_rows": 71237,
+  "window_seconds": 2.56,
+  "hop_seconds": 1.28,
+  "sample_rate": 16000,
+  "feature_shape": [
+    2,
+    128,
+    257
+  ],
+  "score_definition": "mean and max window-level softmax probability for class index 1"
+}

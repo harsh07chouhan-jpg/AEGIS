@@ -1,0 +1,5336 @@
+
+======================== CELL 23 ========================
+MATCHES: softmax
+# ========================================
+# Convert Audio Model Logits to Probabilities
+# ========================================
+
+probabilities = torch.softmax(test_output, dim=1)
+
+authentic_probability = probabilities[0, 0].item()
+manipulated_probability = probabilities[0, 1].item()
+
+print("AEGIS Audio Prediction")
+print("=" * 40)
+print(f"Authentic probability:    {authentic_probability:.4f}")
+print(f"Manipulated probability:  {manipulated_probability:.4f}")
+print(f"Probability sum:          {probabilities.sum().item():.4f}")
+
+======================== CELL 32 ========================
+MATCHES: spoof
+# ========================================
+# Reusable Audio Feature Extraction
+# ========================================
+
+from scipy.signal import resample
+
+def extract_audio_features(
+    waveform,
+    sr=16000,
+    n_fft=1024,
+    hop_length=160,
+    n_mels=128,
+    fmin=20,
+    fmax=8000,
+    cqt_fmin=65.4,
+    cqt_bins=128,
+    cqt_bins_per_octave=24,
+    target_time_frames=257
+):
+    """
+    Convert a fixed-length waveform into:
+    [Log-Mel Spectrogram, CQT]
+
+    Output shape: (2, 128, 257)
+    """
+
+    # -----------------------------
+    # 1. Log-Mel Spectrogram
+    # -----------------------------
+    mel = librosa.feature.melspectrogram(
+        y=waveform,
+        sr=sr,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        n_mels=n_mels,
+        fmin=fmin,
+        fmax=fmax
+    )
+
+    log_mel = librosa.power_to_db(
+        mel,
+        ref=np.max
+    )
+
+    # -----------------------------
+    # 2. CQT
+    # -----------------------------
+    cqt = librosa.cqt(
+        waveform,
+        sr=sr,
+        hop_length=hop_length,
+        fmin=cqt_fmin,
+        n_bins=cqt_bins,
+        bins_per_octave=cqt_bins_per_octave
+    )
+
+    cqt_magnitude = np.abs(cqt)
+
+    # Align CQT time dimension with Log-Mel
+    cqt_aligned = resample(
+        cqt_magnitude,
+        target_time_frames,
+        axis=1
+    )
+
+    cqt_aligned = librosa.amplitude_to_db(
+        np.maximum(cqt_aligned, 1e-10),
+        ref=np.max
+    )
+
+    # -----------------------------
+    # 3. Stack Features
+    # -----------------------------
+    audio_features = np.stack(
+        [log_mel, cqt_aligned],
+        axis=0
+    ).astype(np.float32)
+
+    return audio_features
+
+
+# Test feature extraction on the real ASVspoof window
+test_features = extract_audio_features(
+    waveform,
+    sr=sr
+)
+
+print("Audio Feature Extraction Test")
+print("=" * 40)
+print("Feature shape:", test_features.shape)
+print("Data type:", test_features.dtype)
+print("Minimum:", test_features.min())
+print("Maximum:", test_features.max())
+print("Contains NaN:", np.isnan(test_features).any())
+print("Contains Inf:", np.isinf(test_features).any())
+
+======================== CELL 34 ========================
+MATCHES: spoof
+# ========================================
+# AEGIS Audio Dataset
+# ========================================
+
+import torch
+from torch.utils.data import Dataset
+
+
+class AEGISAudioDataset(Dataset):
+
+    def __init__(
+        self,
+        window_index,
+        target_sr=16000,
+        window_seconds=2.56
+    ):
+        self.window_index = window_index.reset_index(drop=True)
+        self.target_sr = target_sr
+        self.window_seconds = window_seconds
+
+    def __len__(self):
+        return len(self.window_index)
+
+    def __getitem__(self, idx):
+
+        row = self.window_index.iloc[idx]
+
+        # 1. Load temporal audio window
+        waveform, sr = preprocess_audio(
+            row["file_path"],
+            start_sec=row["start_sec"],
+            window_seconds=self.window_seconds,
+            target_sr=self.target_sr
+        )
+
+        # 2. Extract Log-Mel + CQT features
+        features = extract_audio_features(
+            waveform,
+            sr=sr
+        )
+
+        # 3. Convert to PyTorch tensor
+        features = torch.from_numpy(features)
+
+        # 4. Convert label
+        label = 1 if row["label"] == "spoof" else 0
+
+        label = torch.tensor(
+            label,
+            dtype=torch.long
+        )
+
+        return {
+            "features": features,
+            "label": label,
+            "window_id": row["window_id"],
+            "sample_id": row["sample_id"],
+            "start_sec": row["start_sec"],
+            "end_sec": row["end_sec"]
+        }
+
+======================== CELL 36 ========================
+MATCHES: spoof
+# ========================================
+# Verify Spoof Sample
+# ========================================
+
+spoof_index = window_index[
+    window_index["label"] == "spoof"
+].index[0]
+
+spoof_sample = test_dataset[spoof_index]
+
+print("=== AEGIS Spoof Sample Test ===")
+
+print("Window ID:", spoof_sample["window_id"])
+print("Sample ID:", spoof_sample["sample_id"])
+print("Start:", spoof_sample["start_sec"])
+print("End:", spoof_sample["end_sec"])
+
+print("\n--- Features ---")
+print("Shape:", spoof_sample["features"].shape)
+print("Dtype:", spoof_sample["features"].dtype)
+
+print("\n--- Label ---")
+print("Label:", spoof_sample["label"].item())
+
+print("\n--- Safety ---")
+print(
+    "Contains NaN:",
+    torch.isnan(spoof_sample["features"]).any().item()
+)
+
+print(
+    "Contains Inf:",
+    torch.isinf(spoof_sample["features"]).any().item()
+)
+
+======================== CELL 37 ========================
+MATCHES: train_loader, val_loader, DataLoader, validation
+# ========================================
+# Train / Validation DataLoaders
+# ========================================
+
+from torch.utils.data import DataLoader
+
+# Split window index
+train_window_index = window_index[
+    window_index["split"] == "train"
+].reset_index(drop=True)
+
+val_window_index = window_index[
+    window_index["split"] == "dev"
+].reset_index(drop=True)
+
+print("Train windows:", len(train_window_index))
+print("Validation windows:", len(val_window_index))
+
+
+# Create datasets
+train_dataset = AEGISAudioDataset(
+    window_index=train_window_index
+)
+
+val_dataset = AEGISAudioDataset(
+    window_index=val_window_index
+)
+
+
+# Create DataLoaders
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=16,
+    shuffle=True,
+    num_workers=0
+)
+
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=16,
+    shuffle=False,
+    num_workers=0
+)
+
+print("\nDataLoaders created successfully.")
+print("Train batches:", len(train_loader))
+print("Validation batches:", len(val_loader))
+
+======================== CELL 38 ========================
+MATCHES: train_loader
+# ========================================
+# Test One Audio Batch
+# ========================================
+
+batch = next(iter(train_loader))
+
+print("=== AEGIS Audio Batch Test ===")
+
+print("\n--- Features ---")
+print("Shape:", batch["features"].shape)
+print("Dtype:", batch["features"].dtype)
+
+print("\n--- Labels ---")
+print("Shape:", batch["label"].shape)
+print("Dtype:", batch["label"].dtype)
+print("Unique labels:", torch.unique(batch["label"]).tolist())
+
+print("\n--- Metadata ---")
+print("First window:", batch["window_id"][0])
+print("First sample:", batch["sample_id"][0])
+
+print("\n--- Safety ---")
+print(
+    "Feature NaN:",
+    torch.isnan(batch["features"]).any().item()
+)
+
+print(
+    "Feature Inf:",
+    torch.isinf(batch["features"]).any().item()
+)
+
+======================== CELL 39 ========================
+MATCHES: val_loader, validation
+# ========================================
+# Test Validation Batch
+# ========================================
+
+val_batch = next(iter(val_loader))
+
+print("=== AEGIS Validation Batch Test ===")
+
+print("\n--- Features ---")
+print("Shape:", val_batch["features"].shape)
+print("Dtype:", val_batch["features"].dtype)
+
+print("\n--- Labels ---")
+print("Shape:", val_batch["label"].shape)
+print("Dtype:", val_batch["label"].dtype)
+print("Unique labels:", torch.unique(val_batch["label"]).tolist())
+
+print("\n--- Safety ---")
+print(
+    "Feature NaN:",
+    torch.isnan(val_batch["features"]).any().item()
+)
+
+print(
+    "Feature Inf:",
+    torch.isinf(val_batch["features"]).any().item()
+)
+
+======================== CELL 40 ========================
+MATCHES: validation
+# ========================================
+# Validation Class Distribution
+# ========================================
+
+print("=== Validation Class Distribution ===")
+
+print(
+    val_window_index["label"]
+    .value_counts()
+    .sort_index()
+)
+
+print("\nLabel percentages:")
+
+print(
+    val_window_index["label"]
+    .value_counts(normalize=True)
+    .sort_index()
+    .mul(100)
+    .round(2)
+)
+
+======================== CELL 42 ========================
+MATCHES: spoof
+# ========================================
+# Calculate Class Weights
+# ========================================
+
+import torch
+
+class_counts = (
+    train_window_index["label"]
+    .map({"bonafide": 0, "spoof": 1})
+    .value_counts()
+    .sort_index()
+)
+
+num_classes = len(class_counts)
+total_samples = class_counts.sum()
+
+class_weights = (
+    total_samples /
+    (num_classes * class_counts)
+)
+
+class_weights = torch.tensor(
+    class_weights.values,
+    dtype=torch.float32
+)
+
+print("=== AEGIS Class Weights ===")
+print("Class counts:")
+print(class_counts)
+
+print("\nClass weights:")
+print(class_weights)
+
+print("\nMapping:")
+print("Class 0 (bonafide):", class_weights[0].item())
+print("Class 1 (spoof):", class_weights[1].item())
+
+======================== CELL 46 ========================
+MATCHES: CrossEntropyLoss
+# ========================================
+# AEGIS CNN Training Configuration
+# ========================================
+
+# Class-weighted CrossEntropyLoss
+criterion = nn.CrossEntropyLoss(
+    weight=class_weights.to(device)
+)
+
+# Adam optimizer
+optimizer = torch.optim.Adam(
+    model.parameters(),
+    lr=0.001
+)
+
+print("=== Training Configuration ===")
+print("Loss:", criterion)
+print("Optimizer:", optimizer)
+print("Learning rate:", 0.001)
+print("Class weights:", class_weights.tolist())
+
+======================== CELL 49 ========================
+MATCHES: DataLoader
+# ========================================
+# AEGIS Training Function
+# ========================================
+
+def train_one_epoch(
+    model,
+    dataloader,
+    criterion,
+    optimizer,
+    device
+):
+    model.train()
+
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    for batch_data in dataloader:
+
+        features = batch_data["features"].to(device)
+        labels = batch_data["label"].to(device)
+
+        # Clear previous gradients
+        optimizer.zero_grad()
+
+        # Forward pass
+        logits = model(features)
+
+        # Calculate loss
+        loss = criterion(
+            logits,
+            labels
+        )
+
+        # Backpropagation
+        loss.backward()
+
+        # Update weights
+        optimizer.step()
+
+        # Statistics
+        running_loss += (
+            loss.item() * labels.size(0)
+        )
+
+        predictions = torch.argmax(
+            logits,
+            dim=1
+        )
+
+        correct += (
+            predictions == labels
+        ).sum().item()
+
+        total += labels.size(0)
+
+    epoch_loss = running_loss / total
+    epoch_accuracy = correct / total
+
+    return epoch_loss, epoch_accuracy
+
+======================== CELL 50 ========================
+MATCHES: train_loader, DataLoader
+# ========================================
+# AEGIS CNN - First Training Epoch
+# ========================================
+
+print("Starting first training epoch...")
+
+train_loss, train_accuracy = train_one_epoch(
+    model=model,
+    dataloader=train_loader,
+    criterion=criterion,
+    optimizer=optimizer,
+    device=device
+)
+
+print("\n=== Epoch 1 Training Result ===")
+print("Training Loss:", train_loss)
+print("Training Accuracy:", train_accuracy)
+
+======================== CELL 51 ========================
+MATCHES: DataLoader, validation
+# ========================================
+# AEGIS CNN Validation Function
+# ========================================
+
+def evaluate_model(
+    model,
+    dataloader,
+    criterion,
+    device
+):
+    model.eval()
+
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    all_labels = []
+    all_predictions = []
+
+    with torch.no_grad():
+
+        for batch_data in dataloader:
+
+            features = batch_data["features"].to(device)
+            labels = batch_data["label"].to(device)
+
+            # Forward pass
+            logits = model(features)
+
+            # Loss
+            loss = criterion(
+                logits,
+                labels
+            )
+
+            # Statistics
+            running_loss += (
+                loss.item() * labels.size(0)
+            )
+
+            predictions = torch.argmax(
+                logits,
+                dim=1
+            )
+
+            correct += (
+                predictions == labels
+            ).sum().item()
+
+            total += labels.size(0)
+
+            all_labels.extend(
+                labels.cpu().numpy()
+            )
+
+            all_predictions.extend(
+                predictions.cpu().numpy()
+            )
+
+    epoch_loss = running_loss / total
+    epoch_accuracy = correct / total
+
+    return (
+        epoch_loss,
+        epoch_accuracy,
+        np.array(all_labels),
+        np.array(all_predictions)
+    )
+
+======================== CELL 52 ========================
+MATCHES: val_loader, DataLoader, spoof, validation
+# ========================================
+# AEGIS CNN - Validation After Epoch 1
+# ========================================
+
+print("Starting validation...")
+
+val_loss, val_accuracy, val_labels, val_predictions = evaluate_model(
+    model=model,
+    dataloader=val_loader,
+    criterion=criterion,
+    device=device
+)
+
+print("\n=== Validation Result ===")
+print("Validation Loss:", val_loss)
+print("Validation Accuracy:", val_accuracy)
+
+print("\nPrediction distribution:")
+print(
+    "Bonafide predictions:",
+    (val_predictions == 0).sum()
+)
+
+print(
+    "Spoof predictions:",
+    (val_predictions == 1).sum()
+)
+
+======================== CELL 56 ========================
+MATCHES: DataLoader
+# ========================================
+# AEGIS Audio DataLoader
+# ========================================
+
+from torch.utils.data import DataLoader
+
+audio_loader = DataLoader(
+    audio_dataset,
+    batch_size=1,
+    shuffle=False
+)
+
+# Get one batch
+batch_features, batch_labels = next(iter(audio_loader))
+
+print("AEGIS Audio DataLoader")
+print("=" * 40)
+print("Batch feature shape:", batch_features.shape)
+print("Batch label shape:", batch_labels.shape)
+print("Batch label:", batch_labels)
+print("Feature dtype:", batch_features.dtype)
+print("Label dtype:", batch_labels.dtype)
+
+======================== CELL 57 ========================
+MATCHES: softmax
+# ========================================
+# AEGIS Audio Model Forward Pass
+# ========================================
+
+audio_model = AEGISAudioClassifier(num_classes=2)
+
+audio_model.eval()
+
+with torch.no_grad():
+    logits = audio_model(batch_features)
+
+    probabilities = torch.softmax(logits, dim=1)
+
+    predictions = torch.argmax(probabilities, dim=1)
+
+print("AEGIS Audio Model Test")
+print("=" * 40)
+print("Input shape:", batch_features.shape)
+print("Logits shape:", logits.shape)
+print("Probabilities:", probabilities)
+print("Prediction:", predictions)
+print("Probability sum:", probabilities.sum(dim=1))
+
+======================== CELL 62 ========================
+MATCHES: CrossEntropyLoss
+# ========================================
+# AEGIS Audio Training Setup
+# ========================================
+
+import torch.nn as nn
+import torch.optim as optim
+
+# Create a fresh model
+train_model = create_audio_model()
+
+# Classification loss
+criterion = nn.CrossEntropyLoss()
+
+# Optimizer
+optimizer = optim.Adam(
+    train_model.parameters(),
+    lr=0.001
+)
+
+print("AEGIS Audio Training Setup")
+print("=" * 40)
+print("Model:", train_model.__class__.__name__)
+print("Loss:", criterion.__class__.__name__)
+print("Optimizer:", optimizer.__class__.__name__)
+print("Learning rate:", optimizer.param_groups[0]["lr"])
+
+======================== CELL 63 ========================
+MATCHES: DataLoader
+# ========================================
+# AEGIS Audio Training Function
+# ========================================
+
+def train_audio_one_epoch(
+    model,
+    dataloader,
+    criterion,
+    optimizer,
+    device="cpu"
+):
+    """
+    Train the audio model for one epoch.
+    Returns the average training loss.
+    """
+
+    model.train()
+
+    total_loss = 0.0
+    total_samples = 0
+
+    for features, labels in dataloader:
+
+        features = features.to(device)
+        labels = labels.to(device)
+
+        # Clear previous gradients
+        optimizer.zero_grad()
+
+        # Forward pass
+        logits = model(features)
+
+        # Calculate loss
+        loss = criterion(logits, labels)
+
+        # Backpropagation
+        loss.backward()
+
+        # Update model weights
+        optimizer.step()
+
+        # Track loss
+        batch_size = features.size(0)
+
+        total_loss += loss.item() * batch_size
+        total_samples += batch_size
+
+    average_loss = total_loss / total_samples
+
+    return average_loss
+
+
+print("Training function created successfully.")
+
+======================== CELL 64 ========================
+MATCHES: DataLoader, CrossEntropyLoss
+# ========================================
+# Test One Training Epoch
+# ========================================
+
+test_train_model = create_audio_model()
+
+test_criterion = nn.CrossEntropyLoss()
+
+test_optimizer = optim.Adam(
+    test_train_model.parameters(),
+    lr=0.001
+)
+
+test_loss = train_audio_one_epoch(
+    model=test_train_model,
+    dataloader=audio_loader,
+    criterion=test_criterion,
+    optimizer=test_optimizer,
+    device="cpu"
+)
+
+print("One-Epoch Training Test")
+print("=" * 40)
+print("Training loss:", test_loss)
+print("Loss is finite:", np.isfinite(test_loss))
+
+======================== CELL 65 ========================
+MATCHES: DataLoader
+# ========================================
+# AEGIS Audio Evaluation Function
+# ========================================
+
+def evaluate_audio_model(
+    model,
+    dataloader,
+    criterion,
+    device="cpu"
+):
+    """
+    Evaluate the audio model without updating its weights.
+    """
+
+    model.eval()
+
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+
+    all_predictions = []
+    all_labels = []
+
+    with torch.no_grad():
+
+        for features, labels in dataloader:
+
+            features = features.to(device)
+            labels = labels.to(device)
+
+            # Forward pass
+            logits = model(features)
+
+            # Loss
+            loss = criterion(logits, labels)
+
+            # Predictions
+            predictions = torch.argmax(logits, dim=1)
+
+            # Statistics
+            batch_size = features.size(0)
+
+            total_loss += loss.item() * batch_size
+            total_correct += (predictions == labels).sum().item()
+            total_samples += batch_size
+
+            all_predictions.extend(
+                predictions.cpu().numpy()
+            )
+
+            all_labels.extend(
+                labels.cpu().numpy()
+            )
+
+    average_loss = total_loss / total_samples
+    accuracy = total_correct / total_samples
+
+    return {
+        "loss": average_loss,
+        "accuracy": accuracy,
+        "predictions": all_predictions,
+        "labels": all_labels
+    }
+
+
+print("Evaluation function created successfully.")
+
+======================== CELL 66 ========================
+MATCHES: DataLoader
+# ========================================
+# Test Audio Model Evaluation
+# ========================================
+
+evaluation_results = evaluate_audio_model(
+    model=test_train_model,
+    dataloader=audio_loader,
+    criterion=test_criterion,
+    device="cpu"
+)
+
+print("Audio Model Evaluation Test")
+print("=" * 40)
+print("Loss:", evaluation_results["loss"])
+print("Accuracy:", evaluation_results["accuracy"])
+print("Predictions:", evaluation_results["predictions"])
+print("Labels:", evaluation_results["labels"])
+
+======================== CELL 67 ========================
+MATCHES: DataLoader
+# ========================================
+# Verify Model Weight Update
+# ========================================
+
+fresh_model = create_audio_model()
+
+# Save a copy of the initial weights
+initial_weights = {
+    name: param.detach().clone()
+    for name, param in fresh_model.named_parameters()
+}
+
+fresh_optimizer = optim.Adam(
+    fresh_model.parameters(),
+    lr=0.001
+)
+
+# Train for one epoch
+_ = train_audio_one_epoch(
+    model=fresh_model,
+    dataloader=audio_loader,
+    criterion=test_criterion,
+    optimizer=fresh_optimizer,
+    device="cpu"
+)
+
+# Compare weights
+weights_changed = False
+
+for name, param in fresh_model.named_parameters():
+    if not torch.equal(initial_weights[name], param.detach()):
+        weights_changed = True
+        break
+
+print("Model Weight Update Check")
+print("=" * 40)
+print("Weights changed after training:", weights_changed)
+
+======================== CELL 68 ========================
+MATCHES: CrossEntropyLoss
+# ========================================
+# Save AEGIS Audio Baseline Configuration
+# ========================================
+
+audio_baseline_config = {
+    "sample_rate": 16000,
+    "window_seconds": 2.56,
+    "n_fft": 1024,
+    "hop_length": 160,
+    "n_mels": 128,
+    "fmin": 20,
+    "fmax": 8000,
+    "cqt_fmin": 65.4,
+    "cqt_bins": 128,
+    "cqt_bins_per_octave": 24,
+    "target_time_frames": 257,
+    "input_channels": 2,
+    "num_classes": 2,
+    "label_mapping": {
+        "authentic": 0,
+        "manipulated": 1
+    },
+    "model": "AEGISAudioClassifier",
+    "optimizer": "Adam",
+    "learning_rate": 0.001,
+    "loss": "CrossEntropyLoss"
+}
+
+config_path = "../configs/audio_baseline_config.json"
+
+with open(config_path, "w") as f:
+    json.dump(audio_baseline_config, f, indent=4)
+
+print("Audio baseline configuration saved.")
+print("Path:", config_path)
+
+======================== CELL 72 ========================
+MATCHES: validation
+# ========================================
+# Validate Audio Metadata
+# ========================================
+
+def validate_audio_metadata(metadata):
+    """
+    Validate the required fields in the audio metadata.
+    """
+
+    required_columns = [
+        "sample_id",
+        "file_path",
+        "label",
+        "source_dataset",
+        "duration_sec",
+        "sample_rate",
+        "manipulation_type",
+        "speaker_id",
+        "split"
+    ]
+
+    # Check required columns
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in metadata.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            f"Missing required columns: {missing_columns}"
+        )
+
+    # Check labels
+    valid_labels = {"authentic", "manipulated", "unknown"}
+
+    invalid_labels = set(metadata["label"].dropna()) - valid_labels
+
+    if invalid_labels:
+        raise ValueError(
+            f"Invalid labels found: {invalid_labels}"
+        )
+
+    # Check sample rates
+    if (metadata["sample_rate"] <= 0).any():
+        raise ValueError("Invalid sample rate detected.")
+
+    # Check durations
+    if (metadata["duration_sec"] <= 0).any():
+        raise ValueError("Invalid duration detected.")
+
+    # Check file paths
+    missing_files = [
+        path
+        for path in metadata["file_path"]
+        if not Path(path).exists()
+    ]
+
+    if missing_files:
+        raise FileNotFoundError(
+            f"{len(missing_files)} audio files were not found."
+        )
+
+    return True
+
+
+# Validate current metadata
+metadata_valid = validate_audio_metadata(discovered_metadata)
+
+print("Audio metadata validation passed:", metadata_valid)
+
+======================== CELL 74 ========================
+MATCHES: spoof
+from pathlib import Path
+import pandas as pd
+
+
+# ---------------------------------------------------------
+# ASVspoof 2019 LA — CM Protocol Parser
+# ---------------------------------------------------------
+
+PROJECT_ROOT = Path("..").resolve()
+
+ASVSPOOF_ROOT = (
+    PROJECT_ROOT
+    / "data"
+    / "audio_dev"
+    / "raw"
+    / "asvspoof2019"
+    / "LA"
+)
+
+CM_PROTOCOL_DIR = ASVSPOOF_ROOT / "ASVspoof2019_LA_cm_protocols"
+
+TRAIN_AUDIO_DIR = (
+    ASVSPOOF_ROOT
+    / "ASVspoof2019_LA_train"
+    / "flac"
+)
+
+DEV_AUDIO_DIR = (
+    ASVSPOOF_ROOT
+    / "ASVspoof2019_LA_dev"
+    / "flac"
+)
+
+
+def parse_cm_protocol(protocol_path, audio_dir, split):
+    """
+    Parse an ASVspoof 2019 LA CM protocol file.
+
+    Expected format:
+        speaker_id utterance_id field_3 attack_id label
+    """
+
+    protocol_path = Path(protocol_path)
+    audio_dir = Path(audio_dir)
+
+    records = []
+
+    lines = protocol_path.read_text(
+        encoding="utf-8"
+    ).splitlines()
+
+    for line_number, line in enumerate(lines, start=1):
+
+        line = line.strip()
+
+        if not line:
+            continue
+
+        fields = line.split()
+
+        if len(fields) != 5:
+            raise ValueError(
+                f"Unexpected format at line {line_number}: {line}"
+            )
+
+        speaker_id = fields[0]
+        utterance_id = fields[1]
+        field_3 = fields[2]
+        attack_id = fields[3]
+        label = fields[4]
+
+        audio_path = audio_dir / f"{utterance_id}.flac"
+
+        records.append(
+            {
+                "sample_id": utterance_id,
+                "file_path": str(audio_path),
+                "speaker_id": speaker_id,
+                "utterance_id": utterance_id,
+                "field_3": field_3,
+                "attack_id": attack_id,
+                "label": label,
+                "source_dataset": "ASVspoof2019_LA",
+                "split": split,
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
+# ---------------------------------------------------------
+# Parse TRAIN
+# ---------------------------------------------------------
+
+train_protocol = (
+    CM_PROTOCOL_DIR
+    / "ASVspoof2019.LA.cm.train.trn.txt"
+)
+
+train_metadata = parse_cm_protocol(
+    train_protocol,
+    TRAIN_AUDIO_DIR,
+    "train"
+)
+
+
+# ---------------------------------------------------------
+# Parse DEV
+# ---------------------------------------------------------
+
+dev_protocol = (
+    CM_PROTOCOL_DIR
+    / "ASVspoof2019.LA.cm.dev.trl.txt"
+)
+
+dev_metadata = parse_cm_protocol(
+    dev_protocol,
+    DEV_AUDIO_DIR,
+    "dev"
+)
+
+
+# ---------------------------------------------------------
+# Combine
+# ---------------------------------------------------------
+
+audio_metadata = pd.concat(
+    [train_metadata, dev_metadata],
+    ignore_index=True
+)
+
+
+print("Metadata shape:", audio_metadata.shape)
+print()
+print(audio_metadata.head())
+
+======================== CELL 75 ========================
+MATCHES: spoof
+# ---------------------------------------------------------
+# Validate ASVspoof metadata
+# ---------------------------------------------------------
+
+print("Total samples:", len(audio_metadata))
+
+# 1. Split counts
+print("\nSplit counts:")
+print(audio_metadata["split"].value_counts())
+
+# 2. Label counts
+print("\nLabel counts:")
+print(audio_metadata["label"].value_counts())
+
+# 3. Duplicate IDs
+duplicate_ids = audio_metadata["sample_id"].duplicated().sum()
+print("\nDuplicate sample IDs:", duplicate_ids)
+
+# 4. Unique labels
+print("\nUnique labels:")
+print(sorted(audio_metadata["label"].unique()))
+
+# 5. Check that every referenced audio file exists
+file_exists = audio_metadata["file_path"].map(
+    lambda path: Path(path).exists()
+)
+
+print("\nMissing audio files:", (~file_exists).sum())
+
+# 6. Check expected split counts
+expected_counts = {
+    "train": 25380,
+    "dev": 24844
+}
+
+actual_counts = audio_metadata["split"].value_counts().to_dict()
+
+print("\nExpected vs actual:")
+for split, expected in expected_counts.items():
+    actual = actual_counts.get(split, 0)
+    print(f"{split}: expected={expected}, actual={actual}")
+
+======================== CELL 76 ========================
+MATCHES: spoof
+# ---------------------------------------------------------
+# Save validated ASVspoof metadata
+# ---------------------------------------------------------
+
+metadata_output = (
+    PROJECT_ROOT
+    / "data"
+    / "audio_dev"
+    / "processed"
+    / "asvspoof2019_la_metadata.csv"
+)
+
+metadata_output.parent.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+audio_metadata.to_csv(
+    metadata_output,
+    index=False
+)
+
+print(f"Saved metadata to: {metadata_output}")
+print(f"Rows: {len(audio_metadata)}")
+print(f"Columns: {len(audio_metadata.columns)}")
+
+======================== CELL 77 ========================
+MATCHES: spoof
+# ---------------------------------------------------------
+# ASVspoof 2019 LA — Basic Dataset EDA
+# ---------------------------------------------------------
+
+print("Dataset shape:", audio_metadata.shape)
+
+print("\n--- Split distribution ---")
+print(audio_metadata["split"].value_counts())
+
+print("\n--- Label distribution ---")
+label_counts = audio_metadata["label"].value_counts()
+print(label_counts)
+
+print("\n--- Label distribution (%) ---")
+label_percent = (
+    audio_metadata["label"]
+    .value_counts(normalize=True)
+    .mul(100)
+    .round(2)
+)
+print(label_percent)
+
+print("\n--- Attack ID distribution ---")
+print(audio_metadata["attack_id"].value_counts().head(20))
+
+print("\n--- Number of unique speakers ---")
+print(audio_metadata["speaker_id"].nunique())
+
+print("\n--- Speakers per split ---")
+print(
+    audio_metadata.groupby("split")["speaker_id"]
+    .nunique()
+)
+
+======================== CELL 79 ========================
+MATCHES: spoof
+# ---------------------------------------------------------
+# Inspect real ASVspoof audio properties
+# ---------------------------------------------------------
+
+import librosa
+import numpy as np
+
+sample_rows = audio_metadata.sample(
+    n=10,
+    random_state=42
+)
+
+audio_properties = []
+
+for _, row in sample_rows.iterrows():
+
+    waveform, sr = librosa.load(
+        row["file_path"],
+        sr=None,
+        mono=False
+    )
+
+    if waveform.ndim == 1:
+        channels = 1
+        num_samples = waveform.shape[0]
+    else:
+        channels = waveform.shape[0]
+        num_samples = waveform.shape[-1]
+
+    duration_sec = num_samples / sr
+
+    audio_properties.append({
+        "sample_id": row["sample_id"],
+        "label": row["label"],
+        "split": row["split"],
+        "sample_rate": sr,
+        "channels": channels,
+        "duration_sec": duration_sec,
+        "min_amplitude": float(np.min(waveform)),
+        "max_amplitude": float(np.max(waveform)),
+    })
+
+audio_properties_df = pd.DataFrame(audio_properties)
+
+print(audio_properties_df.to_string(index=False))
+
+print("\n--- Summary ---")
+print(
+    audio_properties_df[
+        [
+            "sample_rate",
+            "channels",
+            "duration_sec"
+        ]
+    ].describe()
+)
+
+======================== CELL 81 ========================
+MATCHES: spoof
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10, 5))
+
+plt.hist(
+    duration_df["duration_sec"],
+    bins=50,
+    edgecolor="black"
+)
+
+plt.axvline(
+    2.56,
+    linestyle="--",
+    linewidth=2,
+    label="Current 2.56s window"
+)
+
+plt.xlabel("Duration (seconds)")
+plt.ylabel("Number of audio files")
+plt.title("ASVspoof 2019 LA — Audio Duration Distribution")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+======================== CELL 86 ========================
+MATCHES: spoof
+WINDOW_INDEX_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "audio_dev"
+    / "processed"
+    / "asvspoof2019_la_window_index.csv"
+)
+
+window_index.to_csv(
+    WINDOW_INDEX_PATH,
+    index=False
+)
+
+print("Saved window index:")
+print(WINDOW_INDEX_PATH)
+
+print("\nFile exists:", WINDOW_INDEX_PATH.exists())
+print("Rows saved:", len(window_index))
+
+======================== CELL 87 ========================
+MATCHES: spoof
+import librosa
+import numpy as np
+
+# Select one real ASVspoof window
+test_row = window_index.iloc[0]
+
+audio_path = test_row["file_path"]
+start_sec = test_row["start_sec"]
+end_sec = test_row["end_sec"]
+
+print("Window ID:", test_row["window_id"])
+print("Audio:", audio_path)
+print("Start:", start_sec)
+print("End:", end_sec)
+
+# Load only the required window
+waveform, sr = librosa.load(
+    audio_path,
+    sr=16000,
+    mono=True,
+    offset=start_sec,
+    duration=WINDOW_SEC
+)
+
+expected_samples = int(16000 * WINDOW_SEC)
+
+print("\n--- Extracted Window ---")
+print("Sample rate:", sr)
+print("Samples before padding:", len(waveform))
+print("Expected samples:", expected_samples)
+print("Duration:", len(waveform) / sr)
+print("Min:", waveform.min())
+print("Max:", waveform.max())
+print("Contains NaN:", np.isnan(waveform).any())
+print("Contains Inf:", np.isinf(waveform).any())
+
+======================== CELL 91 ========================
+MATCHES: feature_cache
+from pathlib import Path
+
+# ========================================
+# AEGIS Audio Feature Cache
+# ========================================
+
+CACHE_DIR = Path("../data/audio_dev/processed/audio_feature_cache")
+
+CACHE_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+print("Audio feature cache directory:")
+print(CACHE_DIR.resolve())
+print("Exists:", CACHE_DIR.exists())
+
+======================== CELL 93 ========================
+MATCHES: spoof
+# ========================================
+# AEGIS Audio Feature Cache Specification
+# ========================================
+
+import json
+
+CACHE_SPEC = {
+    "feature_type": "log_mel_cqt",
+    "dtype": "float16",
+    "shape_per_window": [2, 128, 257],
+    "channels": [
+        "log_mel",
+        "cqt"
+    ],
+    "sample_rate": 16000,
+    "window_seconds": 2.56,
+    "hop_seconds": 1.28,
+    "n_fft": 1024,
+    "hop_length": 160,
+    "n_mels": 128,
+    "mel_fmin": 20,
+    "mel_fmax": 8000,
+    "cqt_fmin": 65.4,
+    "cqt_bins": 128,
+    "cqt_bins_per_octave": 24,
+    "target_time_frames": 257,
+    "num_windows": len(window_index),
+    "source_window_index": "asvspoof2019_la_window_index.csv"
+}
+
+CACHE_SPEC_PATH = CACHE_DIR / "cache_spec.json"
+
+with open(CACHE_SPEC_PATH, "w", encoding="utf-8") as f:
+    json.dump(CACHE_SPEC, f, indent=4)
+
+print("Cache specification created:")
+print(CACHE_SPEC_PATH.resolve())
+
+print("\nFeature shape:", CACHE_SPEC["shape_per_window"])
+print("Storage dtype:", CACHE_SPEC["dtype"])
+print("Total windows:", CACHE_SPEC["num_windows"])
+
+======================== CELL 94 ========================
+MATCHES: feature_cache, features.dat
+# ========================================
+# Create AEGIS Memory-Mapped Feature Cache
+# ========================================
+
+import numpy as np
+
+CACHE_SHAPE = (
+    len(window_index),
+    2,
+    128,
+    257
+)
+
+CACHE_PATH = CACHE_DIR / "features.dat"
+
+expected_size_gb = (
+    np.prod(CACHE_SHAPE) * np.dtype(np.float16).itemsize
+) / (1024 ** 3)
+
+print("Cache shape:", CACHE_SHAPE)
+print("Storage dtype:", np.float16)
+print(f"Expected storage: {expected_size_gb:.2f} GB")
+
+feature_cache = np.memmap(
+    CACHE_PATH,
+    dtype=np.float16,
+    mode="w+",
+    shape=CACHE_SHAPE
+)
+
+feature_cache.flush()
+
+print("\nMemory-mapped cache created successfully.")
+print("Path:", CACHE_PATH.resolve())
+print("File exists:", CACHE_PATH.exists())
+
+======================== CELL 95 ========================
+MATCHES: feature_cache
+# ========================================
+# Test Memory-Mapped Cache
+# ========================================
+
+# Use the feature tensor we already validated
+test_cache_feature = window_features.astype(np.float16)
+
+# Write to first cache position
+feature_cache[0] = test_cache_feature
+feature_cache.flush()
+
+# Read it back
+cached_feature = feature_cache[0].copy()
+
+print("=== Cache Integrity Test ===")
+print("Original shape:", test_cache_feature.shape)
+print("Cached shape:", cached_feature.shape)
+print("Original dtype:", test_cache_feature.dtype)
+print("Cached dtype:", cached_feature.dtype)
+
+print("\n--- Numerical Check ---")
+print("Original min:", test_cache_feature.min())
+print("Cached min:", cached_feature.min())
+print("Original max:", test_cache_feature.max())
+print("Cached max:", cached_feature.max())
+
+print("\n--- Difference ---")
+max_difference = np.max(
+    np.abs(
+        test_cache_feature.astype(np.float32)
+        - cached_feature.astype(np.float32)
+    )
+)
+
+print("Maximum absolute difference:", max_difference)
+
+print("\n--- Safety ---")
+print("Cached NaN:", np.isnan(cached_feature).any())
+print("Cached Inf:", np.isinf(cached_feature).any())
+
+======================== CELL 97 ========================
+MATCHES: feature_cache
+# ========================================
+# AEGIS Cache Write Test — 10 Windows
+# ========================================
+
+import time
+
+TEST_CACHE_WINDOWS = 10
+
+start_time = time.perf_counter()
+
+for cache_idx in range(TEST_CACHE_WINDOWS):
+
+    row = window_index.iloc[cache_idx]
+
+    # 1. Load the correct temporal window
+    waveform_cache, sr_cache = preprocess_audio(
+        row["file_path"],
+        start_sec=row["start_sec"],
+        window_seconds=WINDOW_SEC,
+        target_sr=16000
+    )
+
+    # 2. Extract Log-Mel + CQT
+    features_cache = extract_audio_features(
+        waveform_cache,
+        sr=sr_cache
+    )
+
+    # 3. Safety check BEFORE storing
+    if not np.isfinite(features_cache).all():
+        raise ValueError(
+            f"Non-finite features detected at cache index {cache_idx}"
+        )
+
+    # 4. Store compact float16 representation
+    feature_cache[cache_idx] = features_cache.astype(np.float16)
+
+feature_cache.flush()
+
+elapsed = time.perf_counter() - start_time
+
+print("=== AEGIS Cache Write Test ===")
+print("Windows written:", TEST_CACHE_WINDOWS)
+print(f"Elapsed time: {elapsed:.2f} seconds")
+
+print("\n--- Cache Verification ---")
+print("Stored shape:", feature_cache[:TEST_CACHE_WINDOWS].shape)
+print("Stored dtype:", feature_cache.dtype)
+print("Contains NaN:", np.isnan(feature_cache[:TEST_CACHE_WINDOWS]).any())
+print("Contains Inf:", np.isinf(feature_cache[:TEST_CACHE_WINDOWS]).any())
+
+print("\nFirst cache entry:")
+print("Window ID:", window_index.iloc[0]["window_id"])
+print("Min:", feature_cache[0].min())
+print("Max:", feature_cache[0].max())
+
+======================== CELL 98 ========================
+MATCHES: feature_cache, features.dat
+# ========================================
+# AEGIS Production Audio Feature Cache
+# ========================================
+
+from tqdm.auto import tqdm
+import json
+import time
+from pathlib import Path
+
+# ----------------------------------------
+# Configuration
+# ----------------------------------------
+
+TOTAL_WINDOWS = len(window_index)
+
+CACHE_PATH = CACHE_DIR / "features.dat"
+PROGRESS_PATH = CACHE_DIR / "progress.json"
+ERROR_LOG_PATH = CACHE_DIR / "extraction_errors.csv"
+
+FLUSH_EVERY = 500
+
+# ----------------------------------------
+# Re-open memory-mapped cache
+# ----------------------------------------
+
+feature_cache = np.memmap(
+    CACHE_PATH,
+    dtype=np.float16,
+    mode="r+",
+    shape=(TOTAL_WINDOWS, 2, 128, 257)
+)
+
+# ----------------------------------------
+# Resume support
+# ----------------------------------------
+
+if PROGRESS_PATH.exists():
+
+    with open(PROGRESS_PATH, "r", encoding="utf-8") as f:
+        progress_info = json.load(f)
+
+    start_index = int(progress_info["last_completed_index"]) + 1
+
+    print("Existing progress found.")
+    print("Resuming from cache index:", start_index)
+
+else:
+
+    start_index = 0
+
+    progress_info = {
+        "last_completed_index": -1,
+        "total_windows": TOTAL_WINDOWS,
+        "status": "started"
+    }
+
+    with open(PROGRESS_PATH, "w", encoding="utf-8") as f:
+        json.dump(progress_info, f, indent=4)
+
+    print("Starting fresh extraction.")
+
+# ----------------------------------------
+# Error log setup
+# ----------------------------------------
+
+if not ERROR_LOG_PATH.exists():
+
+    with open(ERROR_LOG_PATH, "w", encoding="utf-8") as f:
+        f.write(
+            "cache_index,window_id,file_path,error_type,error_message\n"
+        )
+
+# ----------------------------------------
+# Production extraction
+# ----------------------------------------
+
+successful = start_index
+failed = 0
+
+start_time = time.perf_counter()
+
+progress_bar = tqdm(
+    range(start_index, TOTAL_WINDOWS),
+    initial=0,
+    total=TOTAL_WINDOWS - start_index,
+    desc="Extracting AEGIS audio features",
+    unit="window"
+)
+
+for cache_idx in progress_bar:
+
+    row = window_index.iloc[cache_idx]
+
+    try:
+
+        # 1. Load temporal window
+        waveform_cache, sr_cache = preprocess_audio(
+            row["file_path"],
+            start_sec=row["start_sec"],
+            window_seconds=WINDOW_SEC,
+            target_sr=16000
+        )
+
+        # 2. Extract Log-Mel + CQT
+        features_cache = extract_audio_features(
+            waveform_cache,
+            sr=sr_cache
+        )
+
+        # 3. Validate shape
+        expected_shape = (2, 128, 257)
+
+        if features_cache.shape != expected_shape:
+            raise ValueError(
+                f"Unexpected feature shape: "
+                f"{features_cache.shape}"
+            )
+
+        # 4. Validate numerical values
+        if not np.isfinite(features_cache).all():
+            raise ValueError(
+                "Feature tensor contains NaN or Inf"
+            )
+
+        # 5. Store compact representation
+        feature_cache[cache_idx] = (
+            features_cache.astype(np.float16)
+        )
+
+        successful += 1
+
+        # --------------------------------
+        # Periodic checkpoint
+        # --------------------------------
+
+        if (cache_idx + 1) % FLUSH_EVERY == 0:
+
+            feature_cache.flush()
+
+            progress_info = {
+                "last_completed_index": cache_idx,
+                "total_windows": TOTAL_WINDOWS,
+                "successful_windows": successful,
+                "failed_windows": failed,
+                "status": "running"
+            }
+
+            with open(
+                PROGRESS_PATH,
+                "w",
+                encoding="utf-8"
+            ) as f:
+                json.dump(progress_info, f, indent=4)
+
+    except Exception as e:
+
+        failed += 1
+
+        with open(
+            ERROR_LOG_PATH,
+            "a",
+            encoding="utf-8"
+        ) as f:
+
+            f.write(
+                f'{cache_idx},'
+                f'"{row["window_id"]}",'
+                f'"{row["file_path"]}",'
+                f'"{type(e).__name__}",'
+                f'"{str(e).replace(chr(34), chr(39))}"\n'
+            )
+
+        # Keep processing instead of stopping the entire run
+        continue
+
+# ----------------------------------------
+# Final flush
+# ----------------------------------------
+
+feature_cache.flush()
+
+elapsed_time = time.perf_counter() - start_time
+
+# ----------------------------------------
+# Final progress record
+# ----------------------------------------
+
+progress_info = {
+    "last_completed_index": TOTAL_WINDOWS - 1,
+    "total_windows": TOTAL_WINDOWS,
+    "successful_windows": successful,
+    "failed_windows": failed,
+    "elapsed_seconds": elapsed_time,
+    "status": "completed"
+}
+
+with open(
+    PROGRESS_PATH,
+    "w",
+    encoding="utf-8"
+) as f:
+
+    json.dump(
+        progress_info,
+        f,
+        indent=4
+    )
+
+# ----------------------------------------
+# Final report
+# ----------------------------------------
+
+print("\n" + "=" * 50)
+print("AEGIS FEATURE CACHE EXTRACTION COMPLETE")
+print("=" * 50)
+
+print("Total windows:", TOTAL_WINDOWS)
+print("Successful:", successful)
+print("Failed:", failed)
+
+print(
+    f"Elapsed time: "
+    f"{elapsed_time / 3600:.2f} hours"
+)
+
+print("\nCache:", CACHE_PATH.resolve())
+print("Progress:", PROGRESS_PATH.resolve())
+print("Errors:", ERROR_LOG_PATH.resolve())
+
+======================== CELL 99 ========================
+MATCHES: feature_cache, spoof
+# ========================================
+# AEGIS Cached Audio Dataset
+# ========================================
+
+class AEGISCachedAudioDataset(Dataset):
+
+    def __init__(
+        self,
+        window_index,
+        cache_path,
+        target_shape=(2, 128, 257)
+    ):
+        self.window_index = window_index.reset_index(drop=True)
+        self.cache_path = Path(cache_path)
+        self.target_shape = target_shape
+
+        # Memory-map the feature cache.
+        # Data is not loaded into RAM all at once.
+        self.feature_cache = np.memmap(
+            self.cache_path,
+            dtype=np.float16,
+            mode="r",
+            shape=(111236, *target_shape)
+        )
+
+    def __len__(self):
+        return len(self.window_index)
+
+    def __getitem__(self, idx):
+
+        row = self.window_index.iloc[idx]
+
+        # Read only this window from the memory-mapped cache
+        features = self.feature_cache[idx]
+
+        # Convert float16 storage → float32 for PyTorch
+        features = torch.from_numpy(
+            features.copy()
+        ).float()
+
+        # Label
+        label = 1 if row["label"] == "spoof" else 0
+
+        label = torch.tensor(
+            label,
+            dtype=torch.long
+        )
+
+        return {
+            "features": features,
+            "label": label,
+            "window_id": row["window_id"],
+            "sample_id": row["sample_id"],
+            "start_sec": row["start_sec"],
+            "end_sec": row["end_sec"]
+        }
+
+
+print("Cached Dataset class created successfully.")
+
+======================== CELL 100 ========================
+MATCHES: spoof
+# ========================================
+# Cached Dataset Sample Test
+# ========================================
+
+cached_dataset = AEGISCachedAudioDataset(
+    window_index=window_index,
+    cache_path=CACHE_PATH
+)
+
+# Find one bonafide and one spoof window
+bonafide_idx = window_index[
+    window_index["label"] == "bonafide"
+].index[0]
+
+spoof_idx = window_index[
+    window_index["label"] == "spoof"
+].index[0]
+
+# Retrieve samples
+bonafide_sample = cached_dataset[bonafide_idx]
+spoof_sample = cached_dataset[spoof_idx]
+
+print("=== Cached Dataset Test ===")
+
+print("\n--- Bonafide ---")
+print("Index:", bonafide_idx)
+print("Window ID:", bonafide_sample["window_id"])
+print("Feature shape:", bonafide_sample["features"].shape)
+print("Feature dtype:", bonafide_sample["features"].dtype)
+print("Label:", bonafide_sample["label"].item())
+print(
+    "NaN:",
+    torch.isnan(bonafide_sample["features"]).any().item()
+)
+print(
+    "Inf:",
+    torch.isinf(bonafide_sample["features"]).any().item()
+)
+
+print("\n--- Spoof ---")
+print("Index:", spoof_idx)
+print("Window ID:", spoof_sample["window_id"])
+print("Feature shape:", spoof_sample["features"].shape)
+print("Feature dtype:", spoof_sample["features"].dtype)
+print("Label:", spoof_sample["label"].item())
+print(
+    "NaN:",
+    torch.isnan(spoof_sample["features"]).any().item()
+)
+print(
+    "Inf:",
+    torch.isinf(spoof_sample["features"]).any().item()
+)
+
+======================== CELL 101 ========================
+MATCHES: validation
+# ========================================
+# AEGIS Cached Train / Validation Datasets
+# ========================================
+
+cached_train_dataset = AEGISCachedAudioDataset(
+    window_index=train_window_index,
+    cache_path=CACHE_PATH
+)
+
+cached_val_dataset = AEGISCachedAudioDataset(
+    window_index=val_window_index,
+    cache_path=CACHE_PATH
+)
+
+print("=== Cached Dataset Sizes ===")
+print("Train windows:", len(cached_train_dataset))
+print("Validation windows:", len(cached_val_dataset))
+
+======================== CELL 102 ========================
+MATCHES: train_loader, val_loader, DataLoader
+# ========================================
+# AEGIS Cached DataLoader Benchmark
+# ========================================
+
+from torch.utils.data import DataLoader
+import time
+
+cached_train_loader = DataLoader(
+    cached_train_dataset,
+    batch_size=16,
+    shuffle=True,
+    num_workers=0
+)
+
+cached_val_loader = DataLoader(
+    cached_val_dataset,
+    batch_size=16,
+    shuffle=False,
+    num_workers=0
+)
+
+# ----------------------------------------
+# Benchmark training batches
+# ----------------------------------------
+
+BENCHMARK_BATCHES = 100
+
+start_time = time.perf_counter()
+
+for batch_idx, batch_data in enumerate(cached_train_loader):
+
+    features = batch_data["features"]
+    labels = batch_data["label"]
+
+    if batch_idx + 1 >= BENCHMARK_BATCHES:
+        break
+
+elapsed = time.perf_counter() - start_time
+
+print("=== Cached DataLoader Benchmark ===")
+print("Batches processed:", BENCHMARK_BATCHES)
+print(f"Elapsed time: {elapsed:.2f} seconds")
+print(
+    f"Average time per batch: "
+    f"{elapsed / BENCHMARK_BATCHES:.4f} seconds"
+)
+
+print("\n--- Batch ---")
+print("Features:", features.shape)
+print("Features dtype:", features.dtype)
+print("Labels:", labels.shape)
+print("Labels dtype:", labels.dtype)
+
+print("\n--- Safety ---")
+print("NaN:", torch.isnan(features).any().item())
+print("Inf:", torch.isinf(features).any().item())
+
+======================== CELL 103 ========================
+MATCHES: CrossEntropyLoss
+# ========================================
+# AEGIS CNN — Cached Feature Experiment
+# ========================================
+
+# Fresh model
+cached_model = AEGISAudioCNN(
+    num_classes=2
+).to(device)
+
+# Same weighted loss used in the original baseline
+cached_criterion = nn.CrossEntropyLoss(
+    weight=class_weights.to(device)
+)
+
+# Fresh optimizer
+cached_optimizer = torch.optim.Adam(
+    cached_model.parameters(),
+    lr=0.001
+)
+
+print("=== Cached CNN Experiment ===")
+print("Device:", device)
+print(
+    "Trainable parameters:",
+    sum(
+        p.numel()
+        for p in cached_model.parameters()
+        if p.requires_grad
+    )
+)
+print("Learning rate:", 0.001)
+print("Batch size:", 16)
+print("Loss: Weighted CrossEntropyLoss")
+print("Optimizer: Adam")
+
+======================== CELL 104 ========================
+MATCHES: validation
+# ========================================
+# AEGIS CNN Baseline — Result Check
+# ========================================
+
+print("=== Existing CNN Baseline Results ===")
+
+print("Validation Loss:", epoch_loss)
+print("Validation Accuracy:", epoch_accuracy)
+
+print("\nLabels shape:", all_labels.shape)
+print("Predictions shape:", all_predictions.shape)
+
+print("\nUnique true labels:", np.unique(all_labels))
+print("Unique predictions:", np.unique(all_predictions))
+
+======================== CELL 105 ========================
+MATCHES: spoof, validation
+# ========================================
+# AEGIS CNN Baseline — Restore Results
+# ========================================
+
+import numpy as np
+from sklearn.metrics import confusion_matrix, classification_report, balanced_accuracy_score
+
+# Stored results from the completed CNN baseline run
+epoch_loss = 0.8545259697319376
+epoch_accuracy = 0.6270186670503183
+
+# Reconstruct labels/predictions from the reported confusion matrix
+# Rows = true labels [bonafide, spoof]
+# Columns = predicted labels [bonafide, spoof]
+
+all_labels = np.array(
+    [0] * 5678 +
+    [1] * 20740 +
+    [1] * 29188
+)
+
+all_predictions = np.array(
+    [0] * 5678 +
+    [0] * 20740 +
+    [1] * 29188
+)
+
+print("=== AEGIS CNN Baseline Results ===")
+
+print(f"Validation Loss:     {epoch_loss:.6f}")
+print(f"Validation Accuracy: {epoch_accuracy:.6f}")
+
+print("\nLabels shape:", all_labels.shape)
+print("Predictions shape:", all_predictions.shape)
+
+print("\nUnique true labels:", np.unique(all_labels))
+print("Unique predictions:", np.unique(all_predictions))
+
+print("\nConfusion Matrix:")
+print(confusion_matrix(all_labels, all_predictions))
+
+print("\nBalanced Accuracy:",
+      balanced_accuracy_score(all_labels, all_predictions))
+
+print("\nClassification Report:")
+print(classification_report(
+    all_labels,
+    all_predictions,
+    target_names=["Bonafide", "Spoof"],
+    digits=4
+))
+
+======================== CELL 106 ========================
+MATCHES: spoof, validation
+# ========================================
+# AEGIS CNN Baseline — Error Analysis
+# ========================================
+
+from sklearn.metrics import confusion_matrix
+
+cm = confusion_matrix(all_labels, all_predictions)
+
+tn, fp, fn, tp = cm.ravel()
+
+print("=== Error Analysis ===")
+
+print(f"True Negatives  (Bonafide → Bonafide): {tn:,}")
+print(f"False Positives (Bonafide → Spoof):    {fp:,}")
+print(f"False Negatives (Spoof → Bonafide):    {fn:,}")
+print(f"True Positives  (Spoof → Spoof):       {tp:,}")
+
+print("\n=== Error Rates ===")
+
+bonafide_total = tn + fp
+spoof_total = fn + tp
+
+false_positive_rate = fp / bonafide_total
+false_negative_rate = fn / spoof_total
+
+print(f"Bonafide False Positive Rate: {false_positive_rate:.4%}")
+print(f"Spoof False Negative Rate:    {false_negative_rate:.4%}")
+
+print("\n=== Detection Rates ===")
+
+bonafide_recall = tn / bonafide_total
+spoof_recall = tp / spoof_total
+
+print(f"Bonafide Detection Rate: {bonafide_recall:.4%}")
+print(f"Spoof Detection Rate:    {spoof_recall:.4%}")
+
+print("\n=== Baseline Interpretation ===")
+
+if spoof_recall < 0.70:
+    print("⚠️ CNN misses a substantial portion of spoof windows.")
+
+if bonafide_recall == 1.0:
+    print("✓ CNN correctly identifies every bonafide validation window.")
+
+if false_negative_rate > false_positive_rate:
+    print("→ Main weakness: false negatives on spoof samples.")
+
+======================== CELL 107 ========================
+MATCHES: train_loader, val_loader
+print("cached_train_dataset:", type(cached_train_dataset).__name__)
+print("cached_val_dataset:", type(cached_val_dataset).__name__)
+print("train_loader:", type(train_loader).__name__)
+print("val_loader:", type(val_loader).__name__)
+
+======================== CELL 109 ========================
+MATCHES: train_loader, softmax
+# ========================================
+# AEGIS Audio Transformer — Forward Test
+# ========================================
+
+audio_transformer.eval()
+
+batch = next(iter(train_loader))
+
+features = batch["features"].to(device)
+labels = batch["label"].to(device)
+
+print("Input shape:", features.shape)
+print("Labels shape:", labels.shape)
+
+# Forward pass
+with torch.no_grad():
+    logits = audio_transformer(features)
+
+print("\nLogits shape:", logits.shape)
+print("Logits:")
+print(logits)
+
+print("\nLogits finite:", torch.isfinite(logits).all().item())
+
+# Check probabilities
+probabilities = torch.softmax(logits, dim=1)
+
+print("\nProbability shape:", probabilities.shape)
+print("First 5 probabilities:")
+print(probabilities[:5])
+
+print("\nProbabilities finite:",
+      torch.isfinite(probabilities).all().item())
+
+print("\nProbability sums:")
+print(probabilities[:5].sum(dim=1))
+
+======================== CELL 110 ========================
+MATCHES: train_loader, CrossEntropyLoss
+# ========================================
+# AEGIS Audio Transformer — Gradient Test
+# ========================================
+
+audio_transformer.train()
+
+# Fresh batch
+batch = next(iter(train_loader))
+
+features = batch["features"].to(device)
+labels = batch["label"].to(device)
+
+# Class-weighted loss
+class_weights = torch.tensor(
+    [5.0453472, 0.5550013],
+    dtype=torch.float32,
+    device=device
+)
+
+criterion = nn.CrossEntropyLoss(
+    weight=class_weights
+)
+
+# Forward
+logits = audio_transformer(features)
+
+# Loss
+loss = criterion(logits, labels)
+
+# Backward
+audio_transformer.zero_grad()
+loss.backward()
+
+# ========================================
+# Gradient diagnostics
+# ========================================
+
+total_params = 0
+params_with_grad = 0
+nonfinite_grads = 0
+gradient_values = []
+
+for name, param in audio_transformer.named_parameters():
+
+    if param.requires_grad:
+        total_params += 1
+
+        if param.grad is not None:
+            params_with_grad += 1
+
+            if not torch.isfinite(param.grad).all():
+                nonfinite_grads += 1
+
+            gradient_values.append(
+                param.grad.detach().abs().mean().item()
+            )
+
+print("=== Transformer Gradient Test ===")
+
+print(f"Loss: {loss.item():.6f}")
+
+print(f"Trainable tensors: {total_params}")
+print(f"Tensors with gradients: {params_with_grad}")
+print(f"Non-finite gradients: {nonfinite_grads}")
+
+if gradient_values:
+    print(
+        f"Mean absolute gradient: "
+        f"{np.mean(gradient_values):.8f}"
+    )
+
+print(
+    "\nGradient flow:",
+    "PASS"
+    if params_with_grad == total_params and nonfinite_grads == 0
+    else "CHECK REQUIRED"
+)
+
+======================== CELL 111 ========================
+MATCHES: train_loader
+# ========================================
+# AEGIS Transformer — Training Speed Check
+# ========================================
+
+import time
+
+audio_transformer.train()
+
+start_time = time.time()
+
+for i, batch in enumerate(train_loader):
+    features = batch["features"].to(device)
+    labels = batch["label"].to(device)
+
+    logits = audio_transformer(features)
+
+    if i == 9:
+        break
+
+elapsed = time.time() - start_time
+
+print("=== Transformer Speed Check ===")
+print(f"Batches tested: 10")
+print(f"Elapsed time: {elapsed:.2f} seconds")
+print(f"Average per batch: {elapsed / 10:.3f} seconds")
+
+======================== CELL 112 ========================
+MATCHES: NUM_EPOCHS, train_loader, CrossEntropyLoss, validation
+# ========================================
+# AEGIS Audio Transformer — Training Setup
+# ========================================
+
+import os
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from pathlib import Path
+
+# ----------------------------------------
+# Training configuration
+# ----------------------------------------
+
+NUM_EPOCHS = 5
+LEARNING_RATE = 3e-4
+WEIGHT_DECAY = 1e-4
+
+CHECKPOINT_DIR = Path(
+    "../models/audio_transformer"
+)
+
+CHECKPOINT_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+BEST_CHECKPOINT = (
+    CHECKPOINT_DIR / "best_audio_transformer.pt"
+)
+
+# ----------------------------------------
+# Model
+# ----------------------------------------
+
+audio_transformer = AEGISAudioTransformer().to(device)
+
+# ----------------------------------------
+# Class-weighted loss
+# ----------------------------------------
+
+class_weights = torch.tensor(
+    [5.0453472, 0.5550013],
+    dtype=torch.float32,
+    device=device
+)
+
+criterion = nn.CrossEntropyLoss(
+    weight=class_weights
+)
+
+# ----------------------------------------
+# Optimizer
+# ----------------------------------------
+
+optimizer = torch.optim.AdamW(
+    audio_transformer.parameters(),
+    lr=LEARNING_RATE,
+    weight_decay=WEIGHT_DECAY
+)
+
+# ----------------------------------------
+# Scheduler
+# ----------------------------------------
+
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode="min",
+    factor=0.5,
+    patience=1
+)
+
+# ----------------------------------------
+# Training state
+# ----------------------------------------
+
+best_val_loss = float("inf")
+best_val_balanced_accuracy = 0.0
+epochs_without_improvement = 0
+
+print("=== AEGIS Audio Transformer Training Setup ===")
+
+print(f"Device:          {device}")
+print(f"Parameters:      {sum(p.numel() for p in audio_transformer.parameters()):,}")
+print(f"Training windows: {len(cached_train_dataset):,}")
+print(f"Validation windows: {len(cached_val_dataset):,}")
+print(f"Batch size:      {train_loader.batch_size}")
+print(f"Epochs:          {NUM_EPOCHS}")
+print(f"Learning rate:   {LEARNING_RATE}")
+print(f"Weight decay:    {WEIGHT_DECAY}")
+
+print("\nCheckpoint:")
+print(BEST_CHECKPOINT)
+
+print("\nTraining setup: READY")
+
+======================== CELL 113 ========================
+MATCHES: NUM_EPOCHS, train_loader, val_loader, spoof, validation
+# ========================================
+# AEGIS Audio Transformer — Epoch 1
+# ========================================
+
+from sklearn.metrics import balanced_accuracy_score, f1_score, recall_score
+import time
+import torch
+
+NUM_EPOCHS = 1
+
+for epoch in range(NUM_EPOCHS):
+
+    epoch_start = time.time()
+
+    # ====================================
+    # Training
+    # ====================================
+
+    audio_transformer.train()
+
+    train_loss = 0.0
+    train_correct = 0
+    train_total = 0
+
+    train_labels = []
+    train_preds = []
+
+    for batch_idx, batch in enumerate(train_loader):
+
+        features = batch["features"].to(device)
+        labels = batch["label"].to(device)
+
+        optimizer.zero_grad()
+
+        logits = audio_transformer(features)
+
+        loss = criterion(logits, labels)
+
+        loss.backward()
+
+        # Prevent occasional exploding gradients
+        torch.nn.utils.clip_grad_norm_(
+            audio_transformer.parameters(),
+            max_norm=1.0
+        )
+
+        optimizer.step()
+
+        # Statistics
+        train_loss += loss.item() * labels.size(0)
+
+        predictions = torch.argmax(
+            logits, dim=1
+        )
+
+        train_correct += (
+            predictions == labels
+        ).sum().item()
+
+        train_total += labels.size(0)
+
+        train_labels.extend(
+            labels.detach().cpu().numpy()
+        )
+
+        train_preds.extend(
+            predictions.detach().cpu().numpy()
+        )
+
+        # Progress every 250 batches
+        if (batch_idx + 1) % 250 == 0:
+            print(
+                f"Epoch {epoch+1} | "
+                f"Batch {batch_idx+1}/{len(train_loader)}"
+            )
+
+    train_loss /= train_total
+
+    train_accuracy = (
+        train_correct / train_total
+    )
+
+    train_balanced_acc = balanced_accuracy_score(
+        train_labels,
+        train_preds
+    )
+
+    # ====================================
+    # Validation
+    # ====================================
+
+    audio_transformer.eval()
+
+    val_loss = 0.0
+    val_total = 0
+
+    val_labels = []
+    val_preds = []
+
+    with torch.no_grad():
+
+        for batch_idx, batch in enumerate(val_loader):
+
+            features = batch["features"].to(device)
+            labels = batch["label"].to(device)
+
+            logits = audio_transformer(features)
+
+            loss = criterion(logits, labels)
+
+            val_loss += (
+                loss.item() * labels.size(0)
+            )
+
+            predictions = torch.argmax(
+                logits, dim=1
+            )
+
+            val_total += labels.size(0)
+
+            val_labels.extend(
+                labels.cpu().numpy()
+            )
+
+            val_preds.extend(
+                predictions.cpu().numpy()
+            )
+
+    val_loss /= val_total
+
+    val_balanced_acc = balanced_accuracy_score(
+        val_labels,
+        val_preds
+    )
+
+    val_spoof_recall = recall_score(
+        val_labels,
+        val_preds,
+        pos_label=1
+    )
+
+    val_spoof_f1 = f1_score(
+        val_labels,
+        val_preds,
+        pos_label=1
+    )
+
+    # ====================================
+    # Scheduler
+    # ====================================
+
+    scheduler.step(val_loss)
+
+    # ====================================
+    # Save best checkpoint
+    # ====================================
+
+    if val_balanced_acc > best_val_balanced_accuracy:
+
+        best_val_balanced_accuracy = val_balanced_acc
+        best_val_loss = val_loss
+        epochs_without_improvement = 0
+
+        torch.save(
+            {
+                "epoch": epoch + 1,
+                "model_state_dict":
+                    audio_transformer.state_dict(),
+                "optimizer_state_dict":
+                    optimizer.state_dict(),
+                "scheduler_state_dict":
+                    scheduler.state_dict(),
+                "val_loss": val_loss,
+                "val_balanced_accuracy":
+                    val_balanced_acc,
+                "val_spoof_recall":
+                    val_spoof_recall,
+                "val_spoof_f1":
+                    val_spoof_f1,
+                "model_config": {
+                    "in_channels": 2,
+                    "embed_dim": 128,
+                    "patch_size": (16, 16),
+                    "num_heads": 4,
+                    "num_layers": 4,
+                    "num_classes": 2
+                }
+            },
+            BEST_CHECKPOINT
+        )
+
+        checkpoint_status = "BEST CHECKPOINT SAVED"
+
+    else:
+        epochs_without_improvement += 1
+        checkpoint_status = "No improvement"
+
+    epoch_time = time.time() - epoch_start
+
+    # ====================================
+    # Results
+    # ====================================
+
+    print("\n" + "=" * 60)
+    print(f"TRANSFORMER EPOCH {epoch+1} COMPLETE")
+    print("=" * 60)
+
+    print(f"Train Loss:              {train_loss:.6f}")
+    print(f"Train Accuracy:          {train_accuracy:.4%}")
+    print(f"Train Balanced Accuracy: {train_balanced_acc:.4%}")
+
+    print(f"\nValidation Loss:         {val_loss:.6f}")
+    print(f"Validation Balanced Acc: {val_balanced_acc:.4%}")
+    print(f"Spoof Recall:            {val_spoof_recall:.4%}")
+    print(f"Spoof F1:                {val_spoof_f1:.4f}")
+
+    print(f"\nEpoch Time:              {epoch_time / 60:.2f} minutes")
+    print(f"Checkpoint:              {checkpoint_status}")
+    print("=" * 60)
+
+======================== CELL 114 ========================
+MATCHES: spoof, validation
+# ========================================
+# AEGIS Transformer — Load Best Checkpoint
+# ========================================
+
+import torch
+
+checkpoint = torch.load(
+    BEST_CHECKPOINT,
+    map_location=device
+)
+
+audio_transformer.load_state_dict(
+    checkpoint["model_state_dict"]
+)
+
+audio_transformer.eval()
+
+print("=== Loaded Transformer Checkpoint ===")
+
+print("Checkpoint epoch:",
+      checkpoint["epoch"])
+
+print("Validation loss:",
+      checkpoint["val_loss"])
+
+print("Validation balanced accuracy:",
+      checkpoint["val_balanced_accuracy"])
+
+print("Validation spoof recall:",
+      checkpoint["val_spoof_recall"])
+
+print("Validation spoof F1:",
+      checkpoint["val_spoof_f1"])
+
+print("\nModel loaded successfully.")
+
+======================== CELL 115 ========================
+MATCHES: val_loader, spoof, validation
+# ========================================
+# AEGIS Transformer — Validation Analysis
+# ========================================
+
+from sklearn.metrics import (
+    confusion_matrix,
+    classification_report,
+    balanced_accuracy_score
+)
+
+audio_transformer.eval()
+
+transformer_val_labels = []
+transformer_val_preds = []
+
+with torch.no_grad():
+
+    for batch_idx, batch in enumerate(val_loader):
+
+        features = batch["features"].to(device)
+        labels = batch["label"].to(device)
+
+        logits = audio_transformer(features)
+
+        predictions = torch.argmax(
+            logits,
+            dim=1
+        )
+
+        transformer_val_labels.extend(
+            labels.cpu().numpy()
+        )
+
+        transformer_val_preds.extend(
+            predictions.cpu().numpy()
+        )
+
+transformer_val_labels = np.array(
+    transformer_val_labels
+)
+
+transformer_val_preds = np.array(
+    transformer_val_preds
+)
+
+# ========================================
+# Metrics
+# ========================================
+
+cm = confusion_matrix(
+    transformer_val_labels,
+    transformer_val_preds
+)
+
+tn, fp, fn, tp = cm.ravel()
+
+print("=== Transformer Validation Analysis ===")
+
+print("\nConfusion Matrix:")
+print(cm)
+
+print("\nClassification Report:")
+print(
+    classification_report(
+        transformer_val_labels,
+        transformer_val_preds,
+        target_names=["Bonafide", "Spoof"],
+        digits=4
+    )
+)
+
+print("\n=== Detailed Errors ===")
+
+print(
+    f"Bonafide → Bonafide: {tn:,}"
+)
+
+print(
+    f"Bonafide → Spoof:    {fp:,}"
+)
+
+print(
+    f"Spoof → Bonafide:    {fn:,}"
+)
+
+print(
+    f"Spoof → Spoof:       {tp:,}"
+)
+
+print("\n=== Error Rates ===")
+
+bonafide_total = tn + fp
+spoof_total = fn + tp
+
+print(
+    f"Bonafide False Positive Rate: "
+    f"{fp / bonafide_total:.4%}"
+)
+
+print(
+    f"Spoof False Negative Rate:    "
+    f"{fn / spoof_total:.4%}"
+)
+
+print(
+    f"\nBalanced Accuracy: "
+    f"{balanced_accuracy_score(transformer_val_labels, transformer_val_preds):.4%}"
+)
+
+======================== CELL 116 ========================
+MATCHES: val_loader, softmax, spoof, validation
+# ========================================
+# AEGIS Transformer — Score Analysis
+# ========================================
+
+from sklearn.metrics import (
+    roc_auc_score,
+    balanced_accuracy_score,
+    confusion_matrix
+)
+import numpy as np
+
+audio_transformer.eval()
+
+transformer_scores = []
+transformer_labels = []
+
+with torch.no_grad():
+
+    for batch in val_loader:
+
+        features = batch["features"].to(device)
+        labels = batch["label"].to(device)
+
+        logits = audio_transformer(features)
+
+        # Probability of spoof class
+        probabilities = torch.softmax(
+            logits,
+            dim=1
+        )
+
+        spoof_probability = probabilities[:, 1]
+
+        transformer_scores.extend(
+            spoof_probability.cpu().numpy()
+        )
+
+        transformer_labels.extend(
+            labels.cpu().numpy()
+        )
+
+transformer_scores = np.array(
+    transformer_scores
+)
+
+transformer_labels = np.array(
+    transformer_labels
+)
+
+# ========================================
+# ROC-AUC
+# ========================================
+
+roc_auc = roc_auc_score(
+    transformer_labels,
+    transformer_scores
+)
+
+print("=== Transformer Score Analysis ===")
+
+print(f"Validation samples: {len(transformer_scores):,}")
+
+print(f"\nROC-AUC: {roc_auc:.6f}")
+
+print("\nScore statistics:")
+print(
+    f"Minimum: {transformer_scores.min():.6f}"
+)
+print(
+    f"Maximum: {transformer_scores.max():.6f}"
+)
+print(
+    f"Mean:    {transformer_scores.mean():.6f}"
+)
+print(
+    f"Median:  {np.median(transformer_scores):.6f}"
+)
+
+# ========================================
+# Score statistics by class
+# ========================================
+
+bonafide_scores = transformer_scores[
+    transformer_labels == 0
+]
+
+spoof_scores = transformer_scores[
+    transformer_labels == 1
+]
+
+print("\n=== Score Distribution by Class ===")
+
+print("\nBonafide:")
+print(f"Count:  {len(bonafide_scores):,}")
+print(f"Mean:   {bonafide_scores.mean():.6f}")
+print(f"Median: {np.median(bonafide_scores):.6f}")
+print(f"Std:    {bonafide_scores.std():.6f}")
+
+print("\nSpoof:")
+print(f"Count:  {len(spoof_scores):,}")
+print(f"Mean:   {spoof_scores.mean():.6f}")
+print(f"Median: {np.median(spoof_scores):.6f}")
+print(f"Std:    {spoof_scores.std():.6f}")
+
+# ========================================
+# Threshold analysis
+# ========================================
+
+print("\n=== Threshold Analysis ===")
+
+thresholds = [
+    0.30,
+    0.35,
+    0.40,
+    0.45,
+    0.50,
+    0.55,
+    0.60,
+    0.65,
+    0.70
+]
+
+best_threshold = None
+best_balanced_accuracy = 0.0
+
+for threshold in thresholds:
+
+    predictions = (
+        transformer_scores >= threshold
+    ).astype(int)
+
+    bal_acc = balanced_accuracy_score(
+        transformer_labels,
+        predictions
+    )
+
+    cm = confusion_matrix(
+        transformer_labels,
+        predictions
+    )
+
+    tn, fp, fn, tp = cm.ravel()
+
+    spoof_recall = tp / (tp + fn)
+    bonafide_recall = tn / (tn + fp)
+
+    print(
+        f"Threshold {threshold:.2f} | "
+        f"Balanced Acc: {bal_acc:.4f} | "
+        f"Bonafide Recall: {bonafide_recall:.4f} | "
+        f"Spoof Recall: {spoof_recall:.4f}"
+    )
+
+    if bal_acc > best_balanced_accuracy:
+        best_balanced_accuracy = bal_acc
+        best_threshold = threshold
+
+print("\n=== Best Tested Threshold ===")
+print(f"Threshold: {best_threshold:.2f}")
+print(
+    f"Balanced Accuracy: "
+    f"{best_balanced_accuracy:.6f}"
+)
+
+======================== CELL 118 ========================
+MATCHES: spoof
+import torch
+import numpy as np
+from transformers import AutoFeatureExtractor, AutoModel
+
+# Load pretrained Wav2Vec2
+model_id = "facebook/wav2vec2-base"
+
+extractor = AutoFeatureExtractor.from_pretrained(model_id)
+wav2vec_model = AutoModel.from_pretrained(model_id)
+
+wav2vec_model.eval()
+
+# Use the same real ASVspoof sample we already validated
+sample_path = r"D:\Projects\AEGIS\data\audio_dev\raw\asvspoof2019\LA\ASVspoof2019_LA_train\flac\LA_T_1138215.flac"
+
+# Load with our existing preprocessing pipeline
+waveform, sr = preprocess_audio(
+    sample_path,
+    start_sec=0.0,
+    window_seconds=2.56,
+    target_sr=16000
+)
+
+print("Waveform shape:", waveform.shape)
+print("Sample rate:", sr)
+print("Duration:", len(waveform) / sr)
+
+# Wav2Vec2 expects raw waveform
+inputs = extractor(
+    waveform,
+    sampling_rate=sr,
+    return_tensors="pt"
+)
+
+print("Input shape:", inputs["input_values"].shape)
+
+# Inference only
+with torch.no_grad():
+    outputs = wav2vec_model(**inputs)
+
+hidden_states = outputs.last_hidden_state
+
+print("Embedding shape:", hidden_states.shape)
+print("Embedding dtype:", hidden_states.dtype)
+print("Finite:", torch.isfinite(hidden_states).all().item())
+
+======================== CELL 120 ========================
+MATCHES: spoof
+import torch
+import numpy as np
+from transformers import AutoFeatureExtractor, AutoModel
+
+# Use the already downloaded pretrained model
+model_id = "facebook/wav2vec2-base"
+
+extractor = AutoFeatureExtractor.from_pretrained(model_id)
+wav2vec_model = AutoModel.from_pretrained(model_id)
+wav2vec_model.eval()
+
+# Real ASVspoof 2019 LA sample
+sample_path = r"D:\Projects\AEGIS\data\audio_dev\raw\asvspoof2019\LA\ASVspoof2019_LA_train\flac\LA_T_1138215.flac"
+
+# Existing AEGIS preprocessing
+waveform, sr = preprocess_audio(
+    sample_path,
+    start_sec=0.0,
+    window_seconds=2.56,
+    target_sr=16000
+)
+
+print("Waveform shape:", waveform.shape)
+print("Sample rate:", sr)
+print("Duration:", len(waveform) / sr)
+
+# Convert raw waveform for Wav2Vec2
+inputs = extractor(
+    waveform,
+    sampling_rate=sr,
+    return_tensors="pt"
+)
+
+print("Input shape:", inputs["input_values"].shape)
+
+# Pretrained representation extraction
+with torch.no_grad():
+    outputs = wav2vec_model(**inputs)
+
+hidden_states = outputs.last_hidden_state
+
+print("Embedding shape:", hidden_states.shape)
+print("Embedding dtype:", hidden_states.dtype)
+print("Finite:", torch.isfinite(hidden_states).all().item())
+
+======================== CELL 122 ========================
+MATCHES: spoof, validation
+import pandas as pd
+
+window_index_path = r"D:\Projects\AEGIS\data\audio_dev\processed\asvspoof2019_la_window_index.csv"
+
+window_index = pd.read_csv(window_index_path)
+
+train_window_index = (
+    window_index[window_index["split"] == "train"]
+    .reset_index(drop=True)
+)
+
+val_window_index = (
+    window_index[window_index["split"] == "dev"]
+    .reset_index(drop=True)
+)
+
+print("Total windows:", len(window_index))
+print("Training windows:", len(train_window_index))
+print("Validation windows:", len(val_window_index))
+
+======================== CELL 128 ========================
+MATCHES: val_loader, softmax, validation
+import time
+import torch
+import numpy as np
+
+audio_transformer.eval()
+
+test_scores = []
+test_labels = []
+test_window_ids = []
+
+start_time = time.time()
+
+with torch.no_grad():
+    for batch_idx, batch in enumerate(val_loader):
+
+        features = batch["features"]
+        labels = batch["label"]
+
+        logits = audio_transformer(features)
+
+        probabilities = torch.softmax(logits, dim=1)
+
+        test_scores.extend(
+            probabilities[:, 1].cpu().numpy()
+        )
+
+        test_labels.extend(
+            labels.cpu().numpy()
+        )
+
+        test_window_ids.extend(
+            batch["window_id"]
+        )
+
+        if batch_idx + 1 >= 10:
+            break
+
+elapsed = time.time() - start_time
+
+print("Batches tested:", 10)
+print("Windows tested:", len(test_scores))
+print("Scores shape:", np.asarray(test_scores).shape)
+print("Labels shape:", np.asarray(test_labels).shape)
+print("First 5 scores:", np.round(test_scores[:5], 4))
+print("Unique labels:", np.unique(test_labels))
+print("Scores finite:", np.isfinite(test_scores).all())
+print("Elapsed time:", round(elapsed, 2), "sec")
+print(
+    "Estimated full validation inference:",
+    round(elapsed * (len(val_loader) / 10) / 60, 2),
+    "minutes"
+)
+
+======================== CELL 129 ========================
+MATCHES: feature_cache, features.dat, val_loader, DataLoader, spoof, validation
+from pathlib import Path
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+CACHE_PATH = Path(
+    r"D:\Projects\AEGIS\data\audio_dev\processed\audio_feature_cache\features.dat"
+)
+
+CACHE_SHAPE = (111236, 2, 128, 257)
+
+
+class AEGISCachedAudioDataset(Dataset):
+
+    def __init__(
+        self,
+        window_index,
+        cache_path,
+        cache_shape=CACHE_SHAPE
+    ):
+        self.window_index = window_index.reset_index(drop=True)
+        self.cache_path = Path(cache_path)
+        self.cache_shape = cache_shape
+
+        self.feature_cache = np.memmap(
+            self.cache_path,
+            dtype=np.float16,
+            mode="r",
+            shape=cache_shape
+        )
+
+    def __len__(self):
+        return len(self.window_index)
+
+    def __getitem__(self, idx):
+
+        row = self.window_index.iloc[idx]
+
+        features = self.feature_cache[idx]
+
+        features = torch.from_numpy(
+            features.copy()
+        ).float()
+
+        label = 1 if row["label"] == "spoof" else 0
+
+        return {
+            "features": features,
+            "label": torch.tensor(
+                label,
+                dtype=torch.long
+            ),
+            "window_id": row["window_id"],
+            "sample_id": row["sample_id"],
+            "start_sec": row["start_sec"],
+            "end_sec": row["end_sec"]
+        }
+
+
+cached_val_dataset = AEGISCachedAudioDataset(
+    window_index=val_window_index,
+    cache_path=CACHE_PATH
+)
+
+val_loader = DataLoader(
+    cached_val_dataset,
+    batch_size=16,
+    shuffle=False,
+    num_workers=0
+)
+
+print("Validation dataset:", len(cached_val_dataset))
+print("Validation batches:", len(val_loader))
+
+======================== CELL 130 ========================
+MATCHES: val_loader, softmax, validation
+import time
+import torch
+import numpy as np
+
+audio_transformer.eval()
+
+test_scores = []
+test_labels = []
+test_window_ids = []
+
+start_time = time.time()
+
+with torch.no_grad():
+    for batch_idx, batch in enumerate(val_loader):
+
+        features = batch["features"]
+        labels = batch["label"]
+
+        logits = audio_transformer(features)
+        probabilities = torch.softmax(logits, dim=1)
+
+        test_scores.extend(
+            probabilities[:, 1].cpu().numpy()
+        )
+
+        test_labels.extend(
+            labels.cpu().numpy()
+        )
+
+        test_window_ids.extend(
+            batch["window_id"]
+        )
+
+        if batch_idx + 1 >= 10:
+            break
+
+elapsed = time.time() - start_time
+
+print("Batches tested:", 10)
+print("Windows tested:", len(test_scores))
+print("Scores shape:", np.asarray(test_scores).shape)
+print("Labels shape:", np.asarray(test_labels).shape)
+print("First 5 scores:", np.round(test_scores[:5], 4))
+print("Unique labels:", np.unique(test_labels))
+print("Scores finite:", np.isfinite(test_scores).all())
+print("Elapsed time:", round(elapsed, 2), "sec")
+print(
+    "Estimated full validation inference:",
+    round(elapsed * (len(val_loader) / 10) / 60, 2),
+    "minutes"
+)
+
+======================== CELL 131 ========================
+MATCHES: val_loader, softmax, spoof
+import time
+import numpy as np
+import pandas as pd
+import torch
+from pathlib import Path
+
+audio_transformer.eval()
+
+all_scores = []
+all_labels = []
+all_window_ids = []
+all_sample_ids = []
+all_start_secs = []
+all_end_secs = []
+
+start_time = time.time()
+
+with torch.no_grad():
+
+    for batch_idx, batch in enumerate(val_loader):
+
+        features = batch["features"]
+        labels = batch["label"]
+
+        logits = audio_transformer(features)
+
+        probabilities = torch.softmax(logits, dim=1)
+
+        all_scores.extend(
+            probabilities[:, 1].cpu().numpy()
+        )
+
+        all_labels.extend(
+            labels.cpu().numpy()
+        )
+
+        all_window_ids.extend(
+            batch["window_id"]
+        )
+
+        all_sample_ids.extend(
+            batch["sample_id"]
+        )
+
+        all_start_secs.extend(
+            batch["start_sec"].numpy()
+        )
+
+        all_end_secs.extend(
+            batch["end_sec"].numpy()
+        )
+
+        if (batch_idx + 1) % 500 == 0:
+            print(
+                f"Processed {batch_idx + 1}/{len(val_loader)} batches"
+            )
+
+elapsed = time.time() - start_time
+
+transformer_window_results = pd.DataFrame({
+    "window_id": all_window_ids,
+    "sample_id": all_sample_ids,
+    "start_sec": all_start_secs,
+    "end_sec": all_end_secs,
+    "label": all_labels,
+    "spoof_probability": all_scores
+})
+
+output_path = Path(
+    r"D:\Projects\AEGIS\data\audio_dev\processed\transformer_window_predictions.csv"
+)
+
+transformer_window_results.to_csv(
+    output_path,
+    index=False
+)
+
+print("\nInference complete.")
+print("Rows:", len(transformer_window_results))
+print("Columns:", transformer_window_results.columns.tolist())
+print("Elapsed:", round(elapsed / 60, 2), "minutes")
+print("Output:", output_path)
+print(
+    "Scores finite:",
+    np.isfinite(
+        transformer_window_results["spoof_probability"]
+    ).all()
+)
+print(
+    "Unique labels:",
+    transformer_window_results["label"].unique()
+)
+
+======================== CELL 132 ========================
+MATCHES: spoof
+import pandas as pd
+import numpy as np
+
+pred_path = r"D:\Projects\AEGIS\data\audio_dev\processed\transformer_window_predictions.csv"
+
+pred_df = pd.read_csv(pred_path)
+
+print("Rows:", len(pred_df))
+print("Columns:", pred_df.columns.tolist())
+
+print("\nDuplicate window IDs:", pred_df["window_id"].duplicated().sum())
+print("Missing values:")
+print(pred_df.isna().sum())
+
+print("\nLabel distribution:")
+print(pred_df["label"].value_counts().sort_index())
+
+print("\nScore statistics:")
+print(pred_df["spoof_probability"].describe())
+
+print("\nScore range:",
+      pred_df["spoof_probability"].min(),
+      "to",
+      pred_df["spoof_probability"].max())
+
+print("\nUnique samples:", pred_df["sample_id"].nunique())
+
+print(
+    "\nAll scores finite:",
+    np.isfinite(pred_df["spoof_probability"]).all()
+)
+
+print(
+    "All scores in [0,1]:",
+    pred_df["spoof_probability"].between(0, 1).all()
+)
+
+======================== CELL 133 ========================
+MATCHES: spoof
+import pandas as pd
+import numpy as np
+
+# Load validated window-level predictions
+pred_path = r"D:\Projects\AEGIS\data\audio_dev\processed\transformer_window_predictions.csv"
+
+pred_df = pd.read_csv(pred_path)
+
+# Sort chronologically within each utterance
+pred_df = pred_df.sort_values(
+    ["sample_id", "start_sec"]
+).reset_index(drop=True)
+
+
+def top_k_mean(scores, fraction=0.5):
+    """
+    Mean of the most suspicious fraction of windows.
+    At least one window is always selected.
+    """
+    scores = np.asarray(scores)
+
+    k = max(1, int(np.ceil(len(scores) * fraction)))
+
+    return np.mean(
+        np.sort(scores)[-k:]
+    )
+
+
+# Aggregate windows into utterance-level predictions
+utterance_results = (
+    pred_df
+    .groupby("sample_id")
+    .agg(
+        label=("label", "first"),
+        mean_score=("spoof_probability", "mean"),
+        max_score=("spoof_probability", "max"),
+        num_windows=("window_id", "count")
+    )
+    .reset_index()
+)
+
+# Top-50% suspicious windows
+top50_scores = (
+    pred_df
+    .groupby("sample_id")["spoof_probability"]
+    .apply(lambda x: top_k_mean(x, fraction=0.5))
+    .rename("top50_score")
+    .reset_index()
+)
+
+utterance_results = utterance_results.merge(
+    top50_scores,
+    on="sample_id",
+    how="left"
+)
+
+print("Utterances:", len(utterance_results))
+
+print("\nLabel distribution:")
+print(
+    utterance_results["label"]
+    .value_counts()
+    .sort_index()
+)
+
+print("\nWindows per utterance:")
+print(
+    utterance_results["num_windows"].describe()
+)
+
+print("\nScore summary:")
+print(
+    utterance_results[
+        ["mean_score", "max_score", "top50_score"]
+    ].describe()
+)
+
+print("\nMissing values:")
+print(
+    utterance_results.isna().sum()
+)
+
+======================== CELL 135 ========================
+MATCHES: spoof
+from sklearn.metrics import (
+    confusion_matrix,
+    classification_report,
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score
+)
+
+# Best aggregation from previous analysis
+y_true = utterance_results["label"].values
+scores = utterance_results["mean_score"].values
+
+# EER operating threshold found earlier
+eer_threshold = 0.38403029499999997
+
+# Convert probabilities into predictions
+y_pred = (
+    scores >= eer_threshold
+).astype(int)
+
+# Confusion matrix
+cm = confusion_matrix(
+    y_true,
+    y_pred
+)
+
+# Metrics
+accuracy = np.mean(
+    y_pred == y_true
+)
+
+balanced_acc = balanced_accuracy_score(
+    y_true,
+    y_pred
+)
+
+precision = precision_score(
+    y_true,
+    y_pred,
+    zero_division=0
+)
+
+recall = recall_score(
+    y_true,
+    y_pred,
+    zero_division=0
+)
+
+f1 = f1_score(
+    y_true,
+    y_pred,
+    zero_division=0
+)
+
+print("=== Utterance-Level Transformer Evaluation ===")
+print(f"Threshold: {eer_threshold:.6f}")
+
+print("\nConfusion Matrix:")
+print(cm)
+
+print("\nClassification Report:")
+print(
+    classification_report(
+        y_true,
+        y_pred,
+        target_names=[
+            "Bonafide",
+            "Spoof"
+        ],
+        digits=4,
+        zero_division=0
+    )
+)
+
+print(f"Accuracy:          {accuracy:.4f}")
+print(f"Balanced Accuracy: {balanced_acc:.4f}")
+print(f"Precision:         {precision:.4f}")
+print(f"Spoof Recall:      {recall:.4f}")
+print(f"Spoof F1:          {f1:.4f}")
+
+# Explicit error rates
+tn, fp, fn, tp = cm.ravel()
+
+fpr = fp / (fp + tn)
+fnr = fn / (fn + tp)
+
+print(f"\nFalse Positive Rate: {fpr:.4f} ({fpr*100:.2f}%)")
+print(f"False Negative Rate: {fnr:.4f} ({fnr*100:.2f}%)")
+
+======================== CELL 136 ========================
+MATCHES: spoof
+import pandas as pd
+import numpy as np
+
+from sklearn.metrics import (
+    roc_auc_score,
+    confusion_matrix,
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score
+)
+
+# Load existing window predictions
+pred_path = r"D:\Projects\AEGIS\data\audio_dev\processed\transformer_window_predictions.csv"
+
+pred_df = pd.read_csv(pred_path)
+
+# Load original ASVspoof metadata to recover attack IDs
+metadata_path = r"D:\Projects\AEGIS\data\audio_dev\processed\asvspoof2019_la_metadata.csv"
+
+metadata_df = pd.read_csv(metadata_path)
+
+# Keep only the fields needed to connect predictions to attack type
+attack_lookup = metadata_df[
+    ["sample_id", "attack_id", "speaker_id", "split"]
+].drop_duplicates("sample_id")
+
+# Merge attack information
+attack_predictions = pred_df.merge(
+    attack_lookup,
+    on="sample_id",
+    how="left"
+)
+
+# Use utterance-level mean score
+attack_utterance = (
+    attack_predictions
+    .groupby(["sample_id", "attack_id", "speaker_id"])
+    .agg(
+        label=("label", "first"),
+        mean_score=("spoof_probability", "mean")
+    )
+    .reset_index()
+)
+
+print("Utterance rows:", len(attack_utterance))
+print("Missing attack IDs:", attack_utterance["attack_id"].isna().sum())
+
+print("\nAttack distribution:")
+print(
+    attack_utterance["attack_id"]
+    .value_counts()
+    .sort_index()
+)
+
+# Evaluate each spoof attack separately
+rows = []
+
+for attack_id in sorted(
+    attack_utterance.loc[
+        attack_utterance["attack_id"] != "-",
+        "attack_id"
+    ].unique()
+):
+
+    subset = attack_utterance[
+        attack_utterance["attack_id"] == attack_id
+    ]
+
+    y_true = subset["label"].values
+    scores = subset["mean_score"].values
+
+    # All attack-specific samples should be spoof
+    y_pred = (
+        scores >= 0.38403029499999997
+    ).astype(int)
+
+    tn, fp, fn, tp = confusion_matrix(
+        y_true,
+        y_pred,
+        labels=[0, 1]
+    ).ravel()
+
+    rows.append({
+        "attack_id": attack_id,
+        "samples": len(subset),
+        "mean_score": scores.mean(),
+        "median_score": np.median(scores),
+        "spoof_recall": recall_score(
+            y_true,
+            y_pred,
+            zero_division=0
+        ),
+        "spoof_f1": f1_score(
+            y_true,
+            y_pred,
+            zero_division=0
+        ),
+        "miss_rate": fn / (fn + tp)
+    })
+
+attack_results = pd.DataFrame(rows)
+
+print("\n=== Attack-wise Spoof Performance ===")
+print(
+    attack_results.to_string(
+        index=False,
+        float_format=lambda x: f"{x:.4f}"
+    )
+)
+
+======================== CELL 137 ========================
+MATCHES: spoof
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Bona fide utterance scores
+bonafide_scores = utterance_results.loc[
+    utterance_results["label"] == 0,
+    "mean_score"
+].values
+
+plt.figure(figsize=(10, 6))
+
+plt.hist(
+    bonafide_scores,
+    bins=40,
+    alpha=0.6,
+    density=True,
+    label="Bonafide"
+)
+
+# Plot each spoof attack
+for attack_id in ["A01", "A02", "A03", "A04", "A05", "A06"]:
+
+    scores = attack_utterance.loc[
+        attack_utterance["attack_id"] == attack_id,
+        "mean_score"
+    ].values
+
+    plt.hist(
+        scores,
+        bins=40,
+        alpha=0.35,
+        density=True,
+        label=attack_id
+    )
+
+plt.axvline(
+    0.38403029499999997,
+    linestyle="--",
+    linewidth=2,
+    label="EER threshold"
+)
+
+plt.xlabel("Utterance-level mean spoof probability")
+plt.ylabel("Density")
+plt.title("AEGIS Audio Transformer — Attack-wise Score Distributions")
+plt.legend()
+plt.grid(alpha=0.2)
+
+plt.show()
+
+======================== CELL 138 ========================
+MATCHES: spoof
+# Official ASVspoof 2019 LA attack descriptions
+attack_info = {
+    "A01": {
+        "type": "TTS",
+        "conversion": "AR RNN",
+        "waveform_generation": "WaveNet"
+    },
+    "A02": {
+        "type": "TTS",
+        "conversion": "AR RNN",
+        "waveform_generation": "WORLD"
+    },
+    "A03": {
+        "type": "TTS",
+        "conversion": "Feed-forward NN",
+        "waveform_generation": "WORLD"
+    },
+    "A04": {
+        "type": "TTS",
+        "conversion": "CART",
+        "waveform_generation": "Waveform concatenation"
+    },
+    "A05": {
+        "type": "VC",
+        "conversion": "VAE",
+        "waveform_generation": "WORLD"
+    },
+    "A06": {
+        "type": "VC",
+        "conversion": "GMM-UBM",
+        "waveform_generation": "Spectral filtering + OLA"
+    }
+}
+
+attack_analysis = attack_results.copy()
+
+attack_analysis["type"] = attack_analysis["attack_id"].map(
+    lambda x: attack_info[x]["type"]
+)
+
+attack_analysis["conversion"] = attack_analysis["attack_id"].map(
+    lambda x: attack_info[x]["conversion"]
+)
+
+attack_analysis["waveform_generation"] = attack_analysis["attack_id"].map(
+    lambda x: attack_info[x]["waveform_generation"]
+)
+
+attack_analysis = attack_analysis[
+    [
+        "attack_id",
+        "type",
+        "conversion",
+        "waveform_generation",
+        "samples",
+        "mean_score",
+        "median_score",
+        "spoof_recall",
+        "spoof_f1",
+        "miss_rate"
+    ]
+]
+
+print(
+    attack_analysis.to_string(
+        index=False,
+        float_format=lambda x: f"{x:.4f}"
+    )
+)
+
+======================== CELL 140 ========================
+MATCHES: spoof
+from pathlib import Path
+
+asvspoof_root = Path(
+    r"D:\Projects\AEGIS\data\audio_dev\raw\asvspoof2019"
+)
+
+print("ASVspoof root:")
+print(asvspoof_root)
+
+print("\nTop-level contents:")
+for item in sorted(asvspoof_root.iterdir()):
+    print(item.name)
+
+======================== CELL 141 ========================
+MATCHES: spoof
+from pathlib import Path
+
+la_root = Path(
+    r"D:\Projects\AEGIS\data\audio_dev\raw\asvspoof2019\LA"
+)
+
+print("LA contents:")
+for item in sorted(la_root.iterdir()):
+    if item.is_dir():
+        print(f"[DIR]  {item.name}")
+    else:
+        print(f"[FILE] {item.name}")
+
+======================== CELL 142 ========================
+MATCHES: spoof
+from pathlib import Path
+
+cm_protocol_root = Path(
+    r"D:\Projects\AEGIS\data\audio_dev\raw\asvspoof2019\LA"
+    r"\\ASVspoof2019_LA_cm_protocols"
+)
+
+print("CM protocol files:")
+for item in sorted(cm_protocol_root.iterdir()):
+    if item.is_file():
+        print(f"{item.name}  |  {item.stat().st_size:,} bytes")
+
+======================== CELL 143 ========================
+MATCHES: spoof
+from pathlib import Path
+
+eval_protocol = Path(
+    r"D:\Projects\AEGIS\data\audio_dev\raw\asvspoof2019\LA"
+    r"\\ASVspoof2019_LA_cm_protocols"
+    r"\\ASVspoof2019.LA.cm.eval.trl.txt"
+)
+
+print("First 10 lines of EVAL protocol:\n")
+
+with open(eval_protocol, "r", encoding="utf-8") as f:
+    for i in range(10):
+        line = f.readline()
+        if not line:
+            break
+        print(line.rstrip())
+
+======================== CELL 144 ========================
+MATCHES: spoof
+import pandas as pd
+from pathlib import Path
+
+eval_protocol = Path(
+    r"D:\Projects\AEGIS\data\audio_dev\raw\asvspoof2019\LA"
+    r"\\ASVspoof2019_LA_cm_protocols"
+    r"\\ASVspoof2019.LA.cm.eval.trl.txt"
+)
+
+eval_df = pd.read_csv(
+    eval_protocol,
+    sep=r"\s+",
+    header=None,
+    names=[
+        "speaker_id",
+        "sample_id",
+        "unused",
+        "attack_id",
+        "label"
+    ]
+)
+
+print("Shape:", eval_df.shape)
+
+print("\nLabel distribution:")
+print(eval_df["label"].value_counts())
+
+print("\nAttack distribution:")
+print(eval_df["attack_id"].value_counts().sort_index())
+
+print("\nUnique speakers:", eval_df["speaker_id"].nunique())
+print("Unique samples:", eval_df["sample_id"].nunique())
+
+print("\nMissing values:")
+print(eval_df.isna().sum())
+
+======================== CELL 145 ========================
+MATCHES: spoof
+from pathlib import Path
+
+eval_audio_root = Path(
+    r"D:\Projects\AEGIS\data\audio_dev\raw\asvspoof2019\LA"
+    r"\\ASVspoof2019_LA_eval"
+)
+
+print("EVAL directory:", eval_audio_root)
+
+# Find all FLAC files once
+eval_flac_files = list(eval_audio_root.rglob("*.flac"))
+
+print("FLAC files found:", len(eval_flac_files))
+
+# Map filename stem -> path
+eval_file_map = {
+    path.stem: str(path)
+    for path in eval_flac_files
+}
+
+# Check protocol samples
+eval_df["file_path"] = eval_df["sample_id"].map(eval_file_map)
+
+missing = eval_df["file_path"].isna()
+
+print("Protocol rows:", len(eval_df))
+print("Files matched:", (~missing).sum())
+print("Files missing:", missing.sum())
+
+if missing.sum() > 0:
+    print("\nFirst missing samples:")
+    print(eval_df.loc[missing, "sample_id"].head(20).to_string(index=False))
+else:
+    print("\nPASS: Every EVAL protocol sample has a matching FLAC file.")
+
+======================== CELL 146 ========================
+MATCHES: spoof
+eval_metadata = eval_df[
+    [
+        "sample_id",
+        "speaker_id",
+        "attack_id",
+        "label",
+        "file_path"
+    ]
+].copy()
+
+eval_metadata["split"] = "eval"
+
+eval_metadata_path = (
+    Path(r"D:\Projects\AEGIS\data\audio_dev\processed")
+    / "asvspoof2019_la_eval_metadata.csv"
+)
+
+eval_metadata.to_csv(
+    eval_metadata_path,
+    index=False
+)
+
+print("Saved:", eval_metadata_path)
+print("Shape:", eval_metadata.shape)
+
+print("\nLabels:")
+print(eval_metadata["label"].value_counts())
+
+print("\nAttacks:")
+print(eval_metadata["attack_id"].value_counts().sort_index())
+
+print("\nMissing values:")
+print(eval_metadata.isna().sum())
+
+======================== CELL 148 ========================
+MATCHES: softmax
+import time
+import torch
+import numpy as np
+
+# Use the already-loaded Transformer model and cached preprocessing functions.
+# We will NOT modify the trained model.
+
+model.eval()
+
+# Take the first 100 EVAL windows across the utterances.
+benchmark_rows = []
+
+for _, row in eval_metadata.head(50).iterrows():
+    num_windows = int(row["num_windows"])
+
+    for i in range(num_windows):
+        start_sec = i * HOP_SEC
+
+        benchmark_rows.append({
+            "sample_id": row["sample_id"],
+            "file_path": row["file_path"],
+            "start_sec": start_sec,
+            "label": row["label"],
+            "attack_id": row["attack_id"]
+        })
+
+        if len(benchmark_rows) >= 100:
+            break
+
+    if len(benchmark_rows) >= 100:
+        break
+
+print("Benchmark windows:", len(benchmark_rows))
+
+# Feature extraction
+features = []
+
+start_time = time.time()
+
+for row in benchmark_rows:
+    waveform, sr = preprocess_audio(
+        row["file_path"],
+        start_sec=row["start_sec"],
+        window_seconds=WINDOW_SEC,
+        target_sr=16000
+    )
+
+    feat = extract_audio_features(
+        waveform,
+        sr=sr
+    )
+
+    features.append(feat)
+
+feature_time = time.time() - start_time
+
+# Batch inference
+X = torch.from_numpy(
+    np.stack(features)
+).float()
+
+start_time = time.time()
+
+with torch.no_grad():
+    logits = model(X)
+    probabilities = torch.softmax(logits, dim=1)[:, 1]
+
+inference_time = time.time() - start_time
+
+total_time = feature_time + inference_time
+
+print("\n===== EVAL BENCHMARK =====")
+print(f"Feature extraction: {feature_time:.2f} sec")
+print(f"Model inference:    {inference_time:.2f} sec")
+print(f"Total:              {total_time:.2f} sec")
+
+print("\nThroughput:")
+print(f"Feature extraction: {len(features)/feature_time:.2f} windows/sec")
+print(f"Inference:          {len(features)/inference_time:.2f} windows/sec")
+print(f"Overall:            {len(features)/total_time:.2f} windows/sec")
+
+print("\nOutput:")
+print("Input shape:", X.shape)
+print("Probability shape:", probabilities.shape)
+print("Probability range:",
+      probabilities.min().item(),
+      "to",
+      probabilities.max().item())
+
+print("All finite:",
+      torch.isfinite(probabilities).all().item())
+
+======================== CELL 149 ========================
+MATCHES: spoof, validation
+import torch
+import torch.nn as nn
+from pathlib import Path
+
+# ---------------------------------------------------------
+# 1. Recreate the exact Transformer architecture
+# ---------------------------------------------------------
+
+class AEGISAudioTransformer(nn.Module):
+    def __init__(
+        self,
+        in_channels=2,
+        embed_dim=128,
+        patch_size=(16, 16),
+        num_heads=4,
+        num_layers=4,
+        num_classes=2,
+        dropout=0.1
+    ):
+        super().__init__()
+
+        self.patch_embed = nn.Conv2d(
+            in_channels,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size
+        )
+
+        freq_patches = 128 // patch_size[0]
+        time_patches = 257 // patch_size[1]
+        num_patches = freq_patches * time_patches
+
+        self.cls_token = nn.Parameter(
+            torch.zeros(1, 1, embed_dim)
+        )
+
+        self.pos_embedding = nn.Parameter(
+            torch.zeros(1, num_patches + 1, embed_dim)
+        )
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True
+        )
+
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
+
+        self.norm = nn.LayerNorm(embed_dim)
+
+        self.classifier = nn.Linear(
+            embed_dim,
+            num_classes
+        )
+
+    def forward(self, x):
+        x = self.patch_embed(x)
+
+        # B, C, F, T → B, N, C
+        x = x.flatten(2).transpose(1, 2)
+
+        batch_size = x.size(0)
+
+        cls_tokens = self.cls_token.expand(
+            batch_size, -1, -1
+        )
+
+        x = torch.cat(
+            [cls_tokens, x],
+            dim=1
+        )
+
+        x = x + self.pos_embedding[:, :x.size(1)]
+
+        x = self.transformer(x)
+
+        x = self.norm(x[:, 0])
+
+        return self.classifier(x)
+
+
+# ---------------------------------------------------------
+# 2. Load the saved checkpoint
+# ---------------------------------------------------------
+
+checkpoint_path = Path(
+    r"D:\Projects\AEGIS\models\audio_transformer\best_audio_transformer.pt"
+)
+
+checkpoint = torch.load(
+    checkpoint_path,
+    map_location="cpu"
+)
+
+model_config = checkpoint["model_config"]
+
+model = AEGISAudioTransformer(
+    **model_config
+)
+
+model.load_state_dict(
+    checkpoint["model_state_dict"]
+)
+
+model.eval()
+
+
+# ---------------------------------------------------------
+# 3. Verify checkpoint
+# ---------------------------------------------------------
+
+parameter_count = sum(
+    p.numel() for p in model.parameters()
+)
+
+print("Checkpoint loaded successfully.")
+print("Checkpoint epoch:", checkpoint["epoch"])
+print("Validation loss:", checkpoint["val_loss"])
+print("Validation balanced accuracy:",
+      checkpoint["val_balanced_accuracy"])
+print("Validation spoof recall:",
+      checkpoint["val_spoof_recall"])
+print("Validation spoof F1:",
+      checkpoint["val_spoof_f1"])
+
+print("\nModel configuration:")
+print(model_config)
+
+print("\nParameter count:", parameter_count)
+print("Device: CPU")
+
+======================== CELL 150 ========================
+MATCHES: softmax
+import time
+import torch
+import numpy as np
+
+model.eval()
+
+benchmark_rows = []
+
+for _, row in eval_metadata.head(50).iterrows():
+    num_windows = int(row["num_windows"])
+
+    for i in range(num_windows):
+        start_sec = i * HOP_SEC
+
+        benchmark_rows.append({
+            "sample_id": row["sample_id"],
+            "file_path": row["file_path"],
+            "start_sec": start_sec,
+            "label": row["label"],
+            "attack_id": row["attack_id"]
+        })
+
+        if len(benchmark_rows) >= 100:
+            break
+
+    if len(benchmark_rows) >= 100:
+        break
+
+print("Benchmark windows:", len(benchmark_rows))
+
+features = []
+
+start_time = time.time()
+
+for row in benchmark_rows:
+    waveform, sr = preprocess_audio(
+        row["file_path"],
+        start_sec=row["start_sec"],
+        window_seconds=WINDOW_SEC,
+        target_sr=16000
+    )
+
+    feat = extract_audio_features(
+        waveform,
+        sr=sr
+    )
+
+    features.append(feat)
+
+feature_time = time.time() - start_time
+
+X = torch.from_numpy(
+    np.stack(features)
+).float()
+
+start_time = time.time()
+
+with torch.no_grad():
+    logits = model(X)
+    probabilities = torch.softmax(logits, dim=1)[:, 1]
+
+inference_time = time.time() - start_time
+
+total_time = feature_time + inference_time
+
+print("\n===== EVAL BENCHMARK =====")
+print(f"Feature extraction: {feature_time:.2f} sec")
+print(f"Model inference:    {inference_time:.2f} sec")
+print(f"Total:              {total_time:.2f} sec")
+
+print("\nThroughput:")
+print(f"Feature extraction: {len(features)/feature_time:.2f} windows/sec")
+print(f"Inference:          {len(features)/inference_time:.2f} windows/sec")
+print(f"Overall:            {len(features)/total_time:.2f} windows/sec")
+
+print("\nOutput:")
+print("Input shape:", X.shape)
+print("Probability shape:", probabilities.shape)
+print(
+    "Probability range:",
+    probabilities.min().item(),
+    "to",
+    probabilities.max().item()
+)
+
+print(
+    "All finite:",
+    torch.isfinite(probabilities).all().item()
+)
+
+
+======================== CELL 153 ========================
+MATCHES: softmax, spoof
+import time
+import numpy as np
+import pandas as pd
+import torch
+
+model.eval()
+
+# ---------------------------------------------------------
+# 1. Select only 20 EVAL utterances
+# ---------------------------------------------------------
+
+test_metadata = eval_metadata.head(20).copy()
+
+print("Test utterances:", len(test_metadata))
+
+
+# ---------------------------------------------------------
+# 2. Process each utterance window-by-window
+# ---------------------------------------------------------
+
+results = []
+
+start_total = time.time()
+
+for _, row in test_metadata.iterrows():
+
+    window_scores = []
+
+    num_windows = int(row["num_windows"])
+
+    for window_idx in range(num_windows):
+
+        start_sec = window_idx * HOP_SEC
+
+        waveform, sr = preprocess_audio(
+            row["file_path"],
+            start_sec=start_sec,
+            window_seconds=WINDOW_SEC,
+            target_sr=16000
+        )
+
+        features = extract_audio_features(
+            waveform,
+            sr=sr
+        )
+
+        X = torch.from_numpy(
+            features
+        ).unsqueeze(0).float()
+
+        with torch.no_grad():
+            logits = model(X)
+            spoof_probability = torch.softmax(
+                logits,
+                dim=1
+            )[0, 1].item()
+
+        window_scores.append(spoof_probability)
+
+    # -----------------------------------------------------
+    # Utterance-level aggregation
+    # -----------------------------------------------------
+
+    mean_score = float(np.mean(window_scores))
+    max_score = float(np.max(window_scores))
+
+    results.append({
+        "sample_id": row["sample_id"],
+        "speaker_id": row["speaker_id"],
+        "attack_id": row["attack_id"],
+        "label": row["label"],
+        "duration_sec": row["duration_sec"],
+        "num_windows": num_windows,
+        "mean_score": mean_score,
+        "max_score": max_score
+    })
+
+
+elapsed = time.time() - start_total
+
+test_results = pd.DataFrame(results)
+
+
+# ---------------------------------------------------------
+# 3. Validate output
+# ---------------------------------------------------------
+
+print("\n===== 20-UTTERANCE EVAL TEST =====")
+
+print("Elapsed time:", round(elapsed, 2), "seconds")
+print("Output shape:", test_results.shape)
+
+print("\nColumns:")
+print(test_results.columns.tolist())
+
+print("\nResults:")
+print(test_results.to_string(index=False))
+
+print("\nChecks:")
+
+print(
+    "Unique sample IDs:",
+    test_results["sample_id"].nunique()
+)
+
+print(
+    "Missing values:",
+    test_results.isna().sum().sum()
+)
+
+print(
+    "Mean scores finite:",
+    np.isfinite(test_results["mean_score"]).all()
+)
+
+print(
+    "Max scores finite:",
+    np.isfinite(test_results["max_score"]).all()
+)
+
+print(
+    "Mean score range:",
+    test_results["mean_score"].min(),
+    "to",
+    test_results["mean_score"].max()
+)
+
+print(
+    "Max score range:",
+    test_results["max_score"].min(),
+    "to",
+    test_results["max_score"].max()
+)
+
+======================== CELL 155 ========================
+MATCHES: softmax, spoof
+from pathlib import Path
+
+script_path = Path(
+    r"D:\Projects\AEGIS\src\audio_eval_inference.py"
+)
+
+script_code = r'''
+from pathlib import Path
+import time
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import librosa
+from scipy.signal import resample
+
+
+# =========================================================
+# Configuration
+# =========================================================
+
+PROJECT_ROOT = Path(r"D:\Projects\AEGIS")
+
+METADATA_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "audio_dev"
+    / "processed"
+    / "asvspoof2019_la_eval_metadata.csv"
+)
+
+CHECKPOINT_PATH = (
+    PROJECT_ROOT
+    / "models"
+    / "audio_transformer"
+    / "best_audio_transformer.pt"
+)
+
+OUTPUT_DIR = (
+    PROJECT_ROOT
+    / "results"
+    / "audio_transformer_eval"
+)
+
+OUTPUT_PATH = OUTPUT_DIR / "eval_utterance_predictions.csv"
+
+WINDOW_SEC = 2.56
+HOP_SEC = 1.28
+TARGET_SR = 16000
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# =========================================================
+# Audio preprocessing
+# =========================================================
+
+def preprocess_audio(
+    audio_path,
+    start_sec=0.0,
+    window_seconds=2.56,
+    target_sr=16000
+):
+    waveform, sample_rate = librosa.load(
+        audio_path,
+        sr=target_sr,
+        mono=True,
+        offset=float(start_sec),
+        duration=float(window_seconds)
+    )
+
+    target_samples = int(target_sr * window_seconds)
+
+    if len(waveform) < target_samples:
+        waveform = np.pad(
+            waveform,
+            (0, target_samples - len(waveform)),
+            mode="constant"
+        )
+    elif len(waveform) > target_samples:
+        waveform = waveform[:target_samples]
+
+    waveform = waveform.astype(np.float32)
+
+    if not np.isfinite(waveform).all():
+        raise ValueError(
+            f"Non-finite audio values detected: {audio_path}"
+        )
+
+    return waveform, sample_rate
+
+
+def extract_audio_features(
+    waveform,
+    sr=16000,
+    n_fft=1024,
+    hop_length=160,
+    n_mels=128,
+    fmin=20,
+    fmax=8000,
+    cqt_fmin=65.4,
+    cqt_bins=128,
+    cqt_bins_per_octave=24,
+    target_time_frames=257
+):
+    mel = librosa.feature.melspectrogram(
+        y=waveform,
+        sr=sr,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        n_mels=n_mels,
+        fmin=fmin,
+        fmax=fmax
+    )
+
+    log_mel = librosa.power_to_db(
+        mel,
+        ref=np.max
+    )
+
+    cqt = librosa.cqt(
+        waveform,
+        sr=sr,
+        hop_length=hop_length,
+        fmin=cqt_fmin,
+        n_bins=cqt_bins,
+        bins_per_octave=cqt_bins_per_octave
+    )
+
+    cqt_magnitude = np.abs(cqt)
+
+    cqt_aligned = resample(
+        cqt_magnitude,
+        target_time_frames,
+        axis=1
+    )
+
+    cqt_aligned = librosa.amplitude_to_db(
+        np.maximum(cqt_aligned, 1e-10),
+        ref=np.max
+    )
+
+    audio_features = np.stack(
+        [log_mel, cqt_aligned],
+        axis=0
+    ).astype(np.float32)
+
+    if not np.isfinite(audio_features).all():
+        raise ValueError(
+            "Non-finite values detected in audio features."
+        )
+
+    return audio_features
+
+
+# =========================================================
+# Exact Transformer architecture
+# =========================================================
+
+class AEGISAudioTransformer(nn.Module):
+
+    def __init__(
+        self,
+        in_channels=2,
+        embed_dim=128,
+        patch_size=(16, 16),
+        num_heads=4,
+        num_layers=4,
+        num_classes=2,
+        dropout=0.1
+    ):
+        super().__init__()
+
+        self.patch_embed = nn.Conv2d(
+            in_channels,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size
+        )
+
+        freq_patches = 128 // patch_size[0]
+        time_patches = 257 // patch_size[1]
+
+        num_patches = (
+            freq_patches * time_patches
+        )
+
+        self.cls_token = nn.Parameter(
+            torch.zeros(1, 1, embed_dim)
+        )
+
+        self.pos_embedding = nn.Parameter(
+            torch.zeros(
+                1,
+                num_patches + 1,
+                embed_dim
+            )
+        )
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True
+        )
+
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
+
+        self.norm = nn.LayerNorm(embed_dim)
+
+        self.classifier = nn.Linear(
+            embed_dim,
+            num_classes
+        )
+
+    def forward(self, x):
+
+        x = self.patch_embed(x)
+
+        x = x.flatten(2).transpose(1, 2)
+
+        batch_size = x.size(0)
+
+        cls_tokens = self.cls_token.expand(
+            batch_size,
+            -1,
+            -1
+        )
+
+        x = torch.cat(
+            [cls_tokens, x],
+            dim=1
+        )
+
+        x = x + self.pos_embedding[:, :x.size(1)]
+
+        x = self.transformer(x)
+
+        x = self.norm(x[:, 0])
+
+        return self.classifier(x)
+
+
+# =========================================================
+# Load model
+# =========================================================
+
+print("Loading metadata...")
+
+eval_metadata = pd.read_csv(
+    METADATA_PATH
+)
+
+print(
+    f"EVAL utterances: {len(eval_metadata):,}"
+)
+
+print("Loading checkpoint...")
+
+checkpoint = torch.load(
+    CHECKPOINT_PATH,
+    map_location="cpu"
+)
+
+model_config = checkpoint["model_config"]
+
+model = AEGISAudioTransformer(
+    **model_config
+)
+
+model.load_state_dict(
+    checkpoint["model_state_dict"]
+)
+
+model.eval()
+
+print(
+    "Checkpoint epoch:",
+    checkpoint["epoch"]
+)
+
+print(
+    "Parameters:",
+    sum(p.numel() for p in model.parameters())
+)
+
+
+# =========================================================
+# Resume support
+# =========================================================
+
+if OUTPUT_PATH.exists():
+
+    existing = pd.read_csv(
+        OUTPUT_PATH
+    )
+
+    completed_ids = set(
+        existing["sample_id"]
+    )
+
+    print(
+        f"Existing completed utterances: "
+        f"{len(completed_ids):,}"
+    )
+
+else:
+
+    existing = pd.DataFrame()
+
+    completed_ids = set()
+
+    print(
+        "No previous results found. "
+        "Starting from zero."
+    )
+
+
+# =========================================================
+# Inference
+# =========================================================
+
+new_results = []
+
+start_total = time.time()
+
+for index, row in eval_metadata.iterrows():
+
+    sample_id = row["sample_id"]
+
+    if sample_id in completed_ids:
+        continue
+
+    window_scores = []
+
+    num_windows = int(row["num_windows"])
+
+    try:
+
+        for window_idx in range(num_windows):
+
+            start_sec = (
+                window_idx * HOP_SEC
+            )
+
+            waveform, sr = preprocess_audio(
+                row["file_path"],
+                start_sec=start_sec,
+                window_seconds=WINDOW_SEC,
+                target_sr=TARGET_SR
+            )
+
+            features = extract_audio_features(
+                waveform,
+                sr=sr
+            )
+
+            X = torch.from_numpy(
+                features
+            ).unsqueeze(0).float()
+
+            with torch.no_grad():
+
+                logits = model(X)
+
+                spoof_probability = (
+                    torch.softmax(
+                        logits,
+                        dim=1
+                    )[0, 1].item()
+                )
+
+            if not np.isfinite(
+                spoof_probability
+            ):
+                raise ValueError(
+                    "Non-finite model output."
+                )
+
+            window_scores.append(
+                spoof_probability
+            )
+
+        mean_score = float(
+            np.mean(window_scores)
+        )
+
+        max_score = float(
+            np.max(window_scores)
+        )
+
+        new_results.append({
+
+            "sample_id": sample_id,
+
+            "speaker_id": row["speaker_id"],
+
+            "attack_id": row["attack_id"],
+
+            "label": row["label"],
+
+            "duration_sec": row["duration_sec"],
+
+            "num_windows": num_windows,
+
+            "mean_score": mean_score,
+
+            "max_score": max_score
+        })
+
+    except Exception as exc:
+
+        print(
+            f"\nERROR: {sample_id}: {exc}"
+        )
+
+    # Save every 100 newly processed utterances
+    if len(new_results) >= 100:
+
+        chunk = pd.DataFrame(
+            new_results
+        )
+
+        if OUTPUT_PATH.exists():
+
+            chunk.to_csv(
+                OUTPUT_PATH,
+                mode="a",
+                header=False,
+                index=False
+            )
+
+        else:
+
+            chunk.to_csv(
+                OUTPUT_PATH,
+                index=False
+            )
+
+        completed_ids.update(
+            chunk["sample_id"]
+        )
+
+        new_results = []
+
+        elapsed = (
+            time.time()
+            - start_total
+        )
+
+        print(
+            f"Completed: "
+            f"{len(completed_ids):,}/"
+            f"{len(eval_metadata):,} "
+            f"| elapsed: "
+            f"{elapsed / 60:.1f} min"
+        )
+
+
+# Save remaining results
+
+if new_results:
+
+    chunk = pd.DataFrame(
+        new_results
+    )
+
+    if OUTPUT_PATH.exists():
+
+        chunk.to_csv(
+            OUTPUT_PATH,
+            mode="a",
+            header=False,
+            index=False
+        )
+
+    else:
+
+        chunk.to_csv(
+            OUTPUT_PATH,
+            index=False
+        )
+
+
+elapsed_total = (
+    time.time()
+    - start_total
+)
+
+print("\n================================")
+print("EVAL INFERENCE COMPLETE")
+print("================================")
+
+print(
+    f"Elapsed: "
+    f"{elapsed_total / 3600:.2f} hours"
+)
+
+print(
+    f"Results saved to:\n{OUTPUT_PATH}"
+)
+'''
+
+script_path.write_text(
+    script_code,
+    encoding="utf-8"
+)
+
+print("Script created successfully:")
+print(script_path)
+
+print("\nSize:")
+print(f"{script_path.stat().st_size:,} bytes")
+
+======================== CELL 156 ========================
+MATCHES: spoof, validation
+from pathlib import Path
+
+script_path = Path(
+    r"D:\Projects\AEGIS\src\audio_eval_inference.py"
+)
+
+script_text = script_path.read_text(
+    encoding="utf-8"
+)
+
+checks = {
+    "Metadata path": "asvspoof2019_la_eval_metadata.csv" in script_text,
+    "Checkpoint path": "best_audio_transformer.pt" in script_text,
+    "Window size": "WINDOW_SEC = 2.56" in script_text,
+    "Hop size": "HOP_SEC = 1.28" in script_text,
+    "Resume support": "completed_ids" in script_text,
+    "Incremental saving": "len(new_results) >= 100" in script_text,
+    "Mean aggregation": "np.mean(window_scores)" in script_text,
+    "Max aggregation": "np.max(window_scores)" in script_text,
+    "CPU checkpoint loading": 'map_location="cpu"' in script_text,
+}
+
+print("===== SCRIPT VALIDATION =====")
+
+for name, passed in checks.items():
+    print(f"{name}: {'PASS' if passed else 'FAIL'}")
+
+print("\nTotal checks:", len(checks))
+print("Passed:", sum(checks.values()))
+print("Failed:", len(checks) - sum(checks.values()))
+
+======================== CELL 159 ========================
+MATCHES: spoof
+# Recalculate the exact window count used throughout AEGIS
+# and save it into the EVAL metadata.
+
+eval_metadata["num_windows"] = eval_metadata["duration_sec"].apply(
+    count_windows
+)
+
+eval_metadata_path = Path(
+    r"D:\Projects\AEGIS\data\audio_dev\processed"
+    r"\asvspoof2019_la_eval_metadata.csv"
+)
+
+eval_metadata.to_csv(
+    eval_metadata_path,
+    index=False
+)
+
+print("EVAL metadata updated:")
+print(eval_metadata_path)
+
+print("\nShape:", eval_metadata.shape)
+
+print("\nColumns:")
+print(eval_metadata.columns.tolist())
+
+print("\nTotal EVAL windows:")
+print(eval_metadata["num_windows"].sum())
+
+print("\nWindow statistics:")
+print(eval_metadata["num_windows"].describe())
+
+print("\nMissing values:")
+print(eval_metadata.isna().sum())
+
+======================== CELL 160 ========================
+MATCHES: spoof
+from pathlib import Path
+import pandas as pd
+import numpy as np
+
+eval_metadata_path = Path(
+    r"D:\Projects\AEGIS\data\audio_dev\processed"
+    r"\asvspoof2019_la_eval_metadata.csv"
+)
+
+eval_metadata = pd.read_csv(eval_metadata_path)
+
+print("Loaded EVAL metadata:")
+print("Shape:", eval_metadata.shape)
+
+print("\nColumns:")
+print(eval_metadata.columns.tolist())
+
+print("\nFirst 3 rows:")
+print(eval_metadata.head(3).to_string(index=False))
+
+======================== CELL 162 ========================
+MATCHES: validation
+from pathlib import Path
+import pandas as pd
+import numpy as np
+
+dryrun_path = Path(
+    r"D:\Projects\AEGIS\results\audio_transformer_eval"
+    r"\eval_utterance_predictions_dryrun.csv"
+)
+
+dryrun_results = pd.read_csv(dryrun_path)
+
+print("===== DRY-RUN RESULT VALIDATION =====")
+
+print("Shape:", dryrun_results.shape)
+
+print("\nColumns:")
+print(dryrun_results.columns.tolist())
+
+print("\nLabel distribution:")
+print(dryrun_results["label"].value_counts())
+
+print("\nAttack distribution:")
+print(
+    dryrun_results["attack_id"]
+    .value_counts()
+    .sort_index()
+)
+
+print("\nMissing values:")
+print(dryrun_results.isna().sum())
+
+print("\nUnique sample IDs:")
+print(dryrun_results["sample_id"].nunique())
+
+print("\nScore range:")
+print(
+    dryrun_results["mean_score"].min(),
+    "to",
+    dryrun_results["mean_score"].max()
+)
+
+print("\nAll mean scores finite:")
+print(
+    np.isfinite(
+        dryrun_results["mean_score"]
+    ).all()
+)
+
+print("\nAll max scores finite:")
+print(
+    np.isfinite(
+        dryrun_results["max_score"]
+    ).all()
+)
+
+print("\nFirst 5 results:")
+print(
+    dryrun_results.head().to_string(index=False)
+)
+
+======================== CELL 163 ========================
+MATCHES: spoof
+import pandas as pd
+import numpy as np
+from sklearn.metrics import roc_auc_score, roc_curve
+
+eval_path = r"D:\Projects\AEGIS\results\audio_transformer_eval\eval_utterance_predictions.csv"
+
+eval_results = pd.read_csv(eval_path)
+
+y_true = (eval_results["label"] == "spoof").astype(int).to_numpy()
+y_score = eval_results["mean_score"].to_numpy()
+
+roc_auc = roc_auc_score(y_true, y_score)
+
+fpr, tpr, thresholds = roc_curve(y_true, y_score)
+
+fnr = 1 - tpr
+
+eer_idx = np.nanargmin(np.abs(fpr - fnr))
+
+eer = (fpr[eer_idx] + fnr[eer_idx]) / 2
+eer_threshold = thresholds[eer_idx]
+
+print("===== ASVSPOOF 2019 LA EVAL =====")
+print("Utterances:", len(eval_results))
+print("ROC-AUC:", roc_auc)
+print("EER:", eer)
+print("EER threshold:", eer_threshold)
+print("Score min:", y_score.min())
+print("Score max:", y_score.max())
+print("Score mean:", y_score.mean())
+
+======================== CELL 165 ========================
+MATCHES: spoof
+from sklearn.metrics import roc_auc_score
+
+DEV_THRESHOLD = 0.3840303
+
+eval_results["y_true"] = (
+    eval_results["label"] == "spoof"
+).astype(int)
+
+eval_results["prediction"] = (
+    eval_results["mean_score"] >= DEV_THRESHOLD
+).astype(int)
+
+attack_rows = []
+
+for attack in sorted(
+    eval_results.loc[
+        eval_results["attack_id"] != "-",
+        "attack_id"
+    ].unique()
+):
+
+    subset = eval_results[
+        eval_results["attack_id"] == attack
+    ]
+
+    y_true_attack = subset["y_true"].to_numpy()
+    y_score_attack = subset["mean_score"].to_numpy()
+    y_pred_attack = subset["prediction"].to_numpy()
+
+    recall = (
+        (y_pred_attack == 1).sum()
+        / len(y_true_attack)
+    )
+
+    auc = roc_auc_score(
+        y_true_attack,
+        y_score_attack
+    )
+
+    attack_rows.append({
+        "attack": attack,
+        "samples": len(subset),
+        "mean_score": y_score_attack.mean(),
+        "median_score": np.median(y_score_attack),
+        "ROC_AUC": auc,
+        "spoof_recall": recall,
+        "miss_rate": 1 - recall
+    })
+
+attack_results = pd.DataFrame(attack_rows)
+
+print("===== UNSEEN ATTACK ANALYSIS =====")
+print(
+    attack_results.to_string(index=False)
+)
+
+======================== CELL 166 ========================
+MATCHES: spoof
+from sklearn.metrics import roc_auc_score
+
+bonafide = eval_results[
+    eval_results["label"] == "bonafide"
+]
+
+attack_auc_rows = []
+
+for attack in sorted(
+    eval_results.loc[
+        eval_results["attack_id"] != "-",
+        "attack_id"
+    ].unique()
+):
+
+    spoof_subset = eval_results[
+        eval_results["attack_id"] == attack
+    ]
+
+    subset = pd.concat(
+        [bonafide, spoof_subset],
+        ignore_index=True
+    )
+
+    y_true = (
+        subset["label"] == "spoof"
+    ).astype(int)
+
+    y_score = subset["mean_score"].to_numpy()
+
+    auc = roc_auc_score(
+        y_true,
+        y_score
+    )
+
+    attack_auc_rows.append({
+        "attack": attack,
+        "ROC_AUC_vs_bonafide": auc,
+        "mean_spoof_score": spoof_subset["mean_score"].mean(),
+        "spoof_recall": (
+            spoof_subset["prediction"] == 1
+        ).mean()
+    })
+
+attack_auc_results = pd.DataFrame(
+    attack_auc_rows
+)
+
+print("===== PER-ATTACK ROC-AUC VS BONAFIDE =====")
+print(
+    attack_auc_results.to_string(index=False)
+)
+
+======================== CELL 171 ========================
+MATCHES: spoof
+dev_utterance_results = (
+    dev_window_results
+    .sort_values(["sample_id", "start_sec"])
+    .groupby("sample_id")
+    .agg(
+        label=("label", "first"),
+        mean_score=("spoof_probability", "mean"),
+        max_score=("spoof_probability", "max"),
+        num_windows=("window_id", "count")
+    )
+    .reset_index()
+)
+
+print("===== DEV UTTERANCE RESULTS =====")
+print("Shape:", dev_utterance_results.shape)
+print("Unique utterances:", dev_utterance_results["sample_id"].nunique())
+
+print("\nLabel distribution:")
+print(dev_utterance_results["label"].value_counts())
+
+print("\nMissing values:")
+print(dev_utterance_results.isna().sum())
+
+print("\nScore range:")
+print(
+    dev_utterance_results["mean_score"].min(),
+    "to",
+    dev_utterance_results["mean_score"].max()
+)
+
+======================== CELL 173 ========================
+MATCHES: spoof
+print("===== DEV vs EVAL SCORE SUMMARY =====")
+
+for name, df, label_col in [
+    ("DEV", dev_utterance_results, "label"),
+    ("EVAL", eval_results, "label")
+]:
+
+    print(f"\n{name}")
+
+    if name == "DEV":
+        bonafide = df[df[label_col] == 0]["mean_score"]
+        spoof = df[df[label_col] == 1]["mean_score"]
+    else:
+        bonafide = df[df[label_col] == "bonafide"]["mean_score"]
+        spoof = df[df[label_col] == "spoof"]["mean_score"]
+
+    print(
+        f"Bonafide  → mean={bonafide.mean():.4f}, "
+        f"median={bonafide.median():.4f}, "
+        f"std={bonafide.std():.4f}"
+    )
+
+    print(
+        f"Spoof     → mean={spoof.mean():.4f}, "
+        f"median={spoof.median():.4f}, "
+        f"std={spoof.std():.4f}"
+    )

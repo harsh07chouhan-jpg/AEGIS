@@ -1,0 +1,56 @@
+{
+  "experiment_name": "aegis_audio_transformer_colab_v1",
+  "seed": 42,
+  "data": {
+    "window_index_csv": "data/audio_dev/processed/asvspoof2019_la_window_index.csv",
+    "feature_cache_dir": "data/audio_dev/processed/audio_feature_cache",
+    "train_split": "train",
+    "val_split": "dev",
+    "expected_total_windows": 111236,
+    "expected_train_windows": 55630,
+    "expected_val_windows": 55606,
+    "feature_shape": [2, 128, 257],
+    "cache_dtype": "float16",
+    "label_mapping": {
+      "bonafide": 0,
+      "spoof": 1
+    }
+  },
+  "model": {
+    "architecture": "AEGISAudioTransformer",
+    "in_channels": 2,
+    "embed_dim": 128,
+    "patch_size": [16, 16],
+    "num_heads": 4,
+    "num_layers": 4,
+    "num_classes": 2,
+    "dropout": 0.1
+  },
+  "training": {
+    "batch_size": 16,
+    "num_workers": 0,
+    "epochs": 5,
+    "optimizer": "AdamW",
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0001,
+    "loss": "CrossEntropyLoss",
+    "class_weights": [5.0453472, 0.5550013],
+    "gradient_clip_max_norm": 1.0,
+    "scheduler": {
+      "name": "ReduceLROnPlateau",
+      "mode": "min",
+      "factor": 0.5,
+      "patience": 1
+    }
+  },
+  "outputs": {
+    "model_dir": "models/audio_transformer_colab_v1",
+    "results_dir": "results/audio_transformer_colab_v1",
+    "checkpoint_name": "best_audio_transformer.pt",
+    "last_checkpoint_name": "last_audio_transformer.pt"
+  },
+  "safety": {
+    "overwrite_existing": false,
+    "run_training_automatically": false
+  }
+}

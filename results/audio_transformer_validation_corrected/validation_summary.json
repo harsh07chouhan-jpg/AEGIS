@@ -1,0 +1,59 @@
+{
+  "evaluation_split": "dev",
+  "checkpoint_path": "D:\\Projects\\AEGIS\\models\\audio_transformer\\best_audio_transformer.pt",
+  "checkpoint_epoch": 1,
+  "checkpoint_model_config": {
+    "in_channels": 2,
+    "embed_dim": 128,
+    "patch_size": [
+      16,
+      16
+    ],
+    "num_heads": 4,
+    "num_layers": 4,
+    "num_classes": 2
+  },
+  "device": "cpu",
+  "number_of_windows": 55606,
+  "cache_position_start": 55630,
+  "cache_position_end": 111235,
+  "cache_positions_match_development_index": true,
+  "class_mapping": {
+    "bonafide": 0,
+    "spoof": 1
+  },
+  "class_counts": {
+    "bonafide": 5678,
+    "spoof": 49928
+  },
+  "weighted_cross_entropy_loss": 0.6651711019556827,
+  "accuracy": 0.5752077113980506,
+  "balanced_accuracy": 0.636548595458263,
+  "spoof_precision": 0.9449913731858317,
+  "spoof_recall": 0.5594656305079314,
+  "spoof_f1": 0.7028319096204411,
+  "roc_auc_spoof_positive": 0.6968245210052105,
+  "average_precision_spoof_positive": 0.9491874238694108,
+  "confusion_matrix_labels_order": [
+    "bonafide_0",
+    "spoof_1"
+  ],
+  "confusion_matrix": [
+    [
+      4052,
+      1626
+    ],
+    [
+      21995,
+      27933
+    ]
+  ],
+  "score_mean_bonafide": 0.38215811205381617,
+  "score_mean_spoof": 0.56302500800781,
+  "notes": [
+    "This evaluates the existing checkpoint without retraining.",
+    "Development features are read using original full-cache row positions.",
+    "Metrics are window-level, not utterance-level.",
+    "ROC-AUC and average precision use spoof as the positive class."
+  ]
+}
