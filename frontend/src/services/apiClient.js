@@ -234,3 +234,55 @@ export function normalizeInferenceResponse(raw) {
     raw,
   }
 }
+
+
+/**
+ * Upload a video file for visual deepfake inference.
+ * Returns the video detector's native response.
+ */
+export async function analyzeVideoFile(file) {
+  if (!file) {
+    throw new ApiError('No video file provided for analysis.', 400, 'missing_file')
+  }
+
+  const formData = new FormData()
+  formData.append('file', file)
+
+  let res
+  try {
+    res = await fetch(`${API_BASE}/analyze/video`, {
+      method: 'POST',
+      body: formData,
+      headers: { Accept: 'application/json' },
+    })
+  } catch (err) {
+    throw new ApiError(
+      'Cannot reach the AEGIS API. Verify that the backend is running at ' + API_BASE,
+      0,
+      'network_unreachable',
+      err
+    )
+  }
+
+  let data
+  try {
+    data = await res.json()
+  } catch (err) {
+    throw new ApiError(
+      `Received invalid response from server (HTTP ${res.status}).`,
+      res.status,
+      'invalid_json',
+      err
+    )
+  }
+
+  if (!res.ok) {
+    const detail = data?.detail
+    const code = detail?.code || `http_${res.status}`
+    const message = detail?.message || (typeof detail === 'string' ? detail : null) ||
+      `Video inference request failed (HTTP ${res.status}).`
+    throw new ApiError(message, res.status, code, data)
+  }
+
+  return data
+}

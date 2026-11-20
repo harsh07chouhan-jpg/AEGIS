@@ -1,7 +1,10 @@
+
 import { useRef, useState, useEffect } from 'react'
 
-const ALLOWED_EXTENSIONS = ['wav', 'flac', 'mp3', 'ogg', 'm4a', 'aiff', 'aif']
-const MAX_BYTES = 50 * 1024 * 1024 // 50 MiB
+const AUDIO_EXTENSIONS = ['wav', 'flac', 'mp3', 'ogg', 'm4a', 'aiff', 'aif']
+const VIDEO_EXTENSIONS = ['mp4', 'mov', 'mkv', 'avi', 'webm', 'm4v']
+const AUDIO_MAX_BYTES = 50 * 1024 * 1024
+const VIDEO_MAX_BYTES = 200 * 1024 * 1024
 
 export function UploadZone({
   file,
@@ -30,10 +33,13 @@ export function UploadZone({
     if (!candidate) return
 
     const ext = candidate.name.split('.').pop()?.toLowerCase() || ''
-    if (!ALLOWED_EXTENSIONS.includes(ext)) {
+    const isVideoFile = VIDEO_EXTENSIONS.includes(ext)
+    const isAudioFile = AUDIO_EXTENSIONS.includes(ext)
+
+    if (!isAudioFile && !isVideoFile) {
       onSelectFile(
         null,
-        `Unsupported audio format (.${ext || 'unknown'}). Supported formats: ${ALLOWED_EXTENSIONS.join(', ').toUpperCase()}`
+        `Unsupported media format (.${ext || 'unknown'}). Audio: ${AUDIO_EXTENSIONS.join(', ').toUpperCase()}. Video: ${VIDEO_EXTENSIONS.join(', ').toUpperCase()}.`
       )
       return
     }
@@ -43,10 +49,13 @@ export function UploadZone({
       return
     }
 
-    if (candidate.size > MAX_BYTES) {
+    const maxBytes = isVideoFile ? VIDEO_MAX_BYTES : AUDIO_MAX_BYTES
+    const maxLabel = isVideoFile ? '200 MiB' : '50 MiB'
+
+    if (candidate.size > maxBytes) {
       onSelectFile(
         null,
-        `File size (${(candidate.size / (1024 * 1024)).toFixed(1)} MiB) exceeds the 50 MiB upload limit.`
+        `File size (${(candidate.size / (1024 * 1024)).toFixed(1)} MiB) exceeds the ${maxLabel} upload limit.`
       )
       return
     }
@@ -70,8 +79,7 @@ export function UploadZone({
     e.preventDefault()
     e.stopPropagation()
     setIsDragging(false)
-    const dropped = e.dataTransfer.files?.[0]
-    handleFileValidation(dropped)
+    handleFileValidation(e.dataTransfer.files?.[0])
   }
 
   function handleTriggerAnalyze() {
@@ -80,6 +88,10 @@ export function UploadZone({
   }
 
   const isOnline = health.status === 'online'
+  const isVideo = Boolean(
+    file && VIDEO_EXTENSIONS.includes(file.name.split('.').pop()?.toLowerCase())
+  )
+  const allowedExtensions = [...AUDIO_EXTENSIONS, ...VIDEO_EXTENSIONS]
   const canAnalyze = Boolean(file) && !busy && isOnline
 
   return (
@@ -88,10 +100,11 @@ export function UploadZone({
         <span className="section-number">01</span>
         <div className="section-header-text">
           <span className="section-kicker">EVIDENCE INGESTION & SCREENING</span>
-          <h2 id="upload-heading">Submit Audio Recording for Analysis</h2>
+          <h2 id="upload-heading">Submit Audio or Video Evidence for Analysis</h2>
           <p className="section-description">
-            Provide a speech recording to screen for synthetic manipulation, voice conversion, or acoustic neural vocoder artifacts.
-            Audio is decoded to 16 kHz mono float32 and evaluated across 2.56-second sliding spectral windows.
+            Upload an audio recording or video file for forensic screening.
+            Audio is evaluated for synthetic speech and manipulation.
+            Video is screened for visual deepfake indicators.
           </p>
         </div>
       </div>
@@ -100,7 +113,7 @@ export function UploadZone({
         ref={fileInputRef}
         type="file"
         className="visually-hidden"
-        accept=".wav,.flac,.mp3,.ogg,.m4a,.aiff,.aif,audio/*"
+        accept=".wav,.flac,.mp3,.ogg,.m4a,.aiff,.aif,.mp4,.mov,.mkv,.avi,.webm,.m4v,audio/*,video/*"
         onChange={(e) => handleFileValidation(e.target.files?.[0])}
         tabIndex={-1}
       />
@@ -119,7 +132,7 @@ export function UploadZone({
         }}
         role="button"
         tabIndex={0}
-        aria-label="Upload audio evidence: drag file here or click to browse"
+        aria-label="Upload audio or video evidence: drag file here or click to browse"
       >
         <div className="dropzone-inner">
           <div className="dropzone-icon">
@@ -145,24 +158,24 @@ export function UploadZone({
               <div className="file-meta-row">
                 <span>{(file.size / (1024 * 1024)).toFixed(2)} MiB</span>
                 <span className="meta-separator">·</span>
-                <span>{file.name.split('.').pop()?.toUpperCase()} audio</span>
+                <span>{file.name.split('.').pop()?.toUpperCase()} {isVideo ? 'video' : 'audio'}</span>
                 <span className="meta-separator">·</span>
                 <span className="status-badge-ready">Ready for analysis</span>
               </div>
             </div>
           ) : (
             <div className="drop-prompt">
-              <strong className="drop-title">Select or drag an audio evidence file to inspect</strong>
+              <strong className="drop-title">Select or drag an audio or video evidence file to inspect</strong>
               <p className="drop-caption">
                 Click to browse files or drop directly into this canvas.
               </p>
               <div className="format-pills">
-                {ALLOWED_EXTENSIONS.map((ext) => (
+                {allowedExtensions.map((ext) => (
                   <span key={ext} className="format-pill">
                     {ext.toUpperCase()}
                   </span>
                 ))}
-                <span className="format-limit">Max 50 MiB</span>
+                <span className="format-limit">Audio max 50 MiB · Video max 200 MiB</span>
               </div>
             </div>
           )}
@@ -205,7 +218,7 @@ export function UploadZone({
             {busy ? (
               <>
                 <span className="editorial-spinner" />
-                <span>Screening Audio… ({elapsedSec.toFixed(1)}s)</span>
+                <span>Screening {isVideo ? 'Video' : 'Audio'}… ({elapsedSec.toFixed(1)}s)</span>
               </>
             ) : (
               <>
@@ -237,7 +250,7 @@ export function UploadZone({
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M12 22s8-4 8-11V5l-8-3-8 3v6c0 7 8 11 8 11Z" />
           </svg>
-          <span>Local In-Memory Processing · Audio Buffers Unlinked Immediately</span>
+          <span>Uploaded media is stored temporarily for inference</span>
         </div>
       </div>
 
@@ -245,7 +258,7 @@ export function UploadZone({
         <p className="offline-notice">
           {health.status === 'checking'
             ? 'Checking connection to local AEGIS FastAPI backend…'
-            : 'FastAPI backend service is offline at 127.0.0.1:8000. Start the server (uvicorn src.api:app) to enable inference.'}
+            : 'FastAPI backend service is offline at 127.0.0.1:8000. Start the backend server to enable inference.'}
         </p>
       )}
     </section>

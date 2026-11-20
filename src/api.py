@@ -2,6 +2,7 @@
 """AEGIS FastAPI backend for the verified audio inference service."""
 
 from contextlib import asynccontextmanager
+from threading import Lock
 import logging
 import os
 from pathlib import Path
@@ -22,11 +23,27 @@ from audio_inference_service import AudioInferenceService, ModelIntegrityError
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("aegis.api")
 
-APP_NAME = "AEGIS Audio Forensics API"
+APP_NAME = "AEGIS Media Forensics API"
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
 # Store one service instance for the lifetime of the application.
 service_state = {"service": None, "startup_error": None}
+
+VIDEO_MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+VIDEO_ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
+_video_service = None
+_video_service_lock = Lock()
+
+
+def get_video_service():
+    """Load the video model on first use, without blocking audio startup."""
+    global _video_service
+    if _video_service is None:
+        with _video_service_lock:
+            if _video_service is None:
+                from video_detector.src.inference import VideoInference
+                _video_service = VideoInference()
+    return _video_service
 
 
 @asynccontextmanager
@@ -47,9 +64,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=APP_NAME,
     description=(
-        "Audio deepfake screening using the verified AEGIS audio model. "
-        "Scores are uncalibrated model scores, not probabilities or proof "
-        "of authenticity."
+        "Audio and video deepfake screening using AEGIS research models. "
+        "Model scores are not proof of authenticity."
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -202,6 +218,106 @@ async def analyze_audio(file: UploadFile = File(...)):
                 pass
             except OSError:
                 logger.warning("Could not remove temporary upload file.")
+
+
+@app.post("/analyze/video")
+async def analyze_video(file: UploadFile = File(...)):
+    """Analyze one video upload; temporary media and visualizations are removed."""
+    filename = Path(file.filename or "upload.mp4").name
+    suffix = Path(filename).suffix.lower()
+    if suffix not in VIDEO_ALLOWED_EXTENSIONS:
+        await file.close()
+        raise HTTPException(
+            status_code=415,
+            detail={
+                "code": "unsupported_video_format",
+                "message": "Supported video formats: MP4, MOV, MKV, AVI, WEBM and M4V.",
+            },
+        )
+
+    total_bytes = 0
+    try:
+        with tempfile.TemporaryDirectory(prefix="aegis_video_") as workdir:
+            temp_path = Path(workdir) / ("upload" + suffix)
+            with temp_path.open("wb") as temp:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total_bytes += len(chunk)
+                    if total_bytes > VIDEO_MAX_UPLOAD_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail={
+                                "code": "file_too_large",
+                                "message": "Maximum video upload size is 200 MiB.",
+                            },
+                        )
+                    temp.write(chunk)
+
+            if total_bytes == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "empty_upload", "message": "The uploaded file is empty."},
+                )
+
+            try:
+                service = await run_in_threadpool(get_video_service)
+            except Exception:
+                logger.exception("AEGIS video model initialization failed.")
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "video_model_unavailable",
+                        "message": "The video model could not be loaded. Check server logs.",
+                    },
+                )
+
+            try:
+                result = await run_in_threadpool(
+                    service.analyze, str(temp_path), None, workdir
+                )
+            except Exception as exc:
+                from detector_runtime import MediaTooLongError
+                from video_detector.src.utils import InferenceError
+
+                if isinstance(exc, MediaTooLongError):
+                    raise HTTPException(
+                        status_code=413,
+                        detail={"code": "media_too_long", "message": str(exc)},
+                    )
+                if isinstance(exc, InferenceError):
+                    raise HTTPException(
+                        status_code=422,
+                        detail={"code": exc.code, "message": exc.message},
+                    )
+                logger.exception("Unexpected video inference failure for %r.", filename)
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "code": "video_inference_failed",
+                        "message": "The video analysis could not be completed.",
+                    },
+                )
+
+            result.pop("local_gradcam_paths", None)
+            result["media_type"] = "video"
+            result["input"] = {
+                "filename": filename,
+                "file_size_bytes": total_bytes,
+            }
+            return result
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unexpected video upload/API failure.")
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "video_api_error", "message": "The video request could not be processed."},
+        )
+    finally:
+        await file.close()
+
 
 
 if __name__ == "__main__":
