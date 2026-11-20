@@ -3,6 +3,8 @@
 
 from contextlib import asynccontextmanager
 from threading import Lock
+from collections import deque
+from time import monotonic
 import logging
 import os
 from pathlib import Path
@@ -33,6 +35,14 @@ VIDEO_MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 VIDEO_ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 _video_service = None
 _video_service_lock = Lock()
+# Shared concurrency guard for CPU-intensive audio/video requests.
+_inference_request_lock = Lock()
+# Global rate limiter for public inference requests.
+RATE_LIMIT_MAX_REQUESTS = 6
+RATE_LIMIT_WINDOW_SECONDS = 60
+
+_rate_limit_lock = Lock()
+_rate_limit_requests = deque()
 
 
 def get_video_service():
@@ -77,12 +87,57 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://localhost:4173",
         "http://127.0.0.1:4173",
+        "https://aegis-9id.pages.dev",
     ],
     allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$",
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+@app.middleware("http")
+async def inference_rate_limit(request, call_next):
+    """Limit audio and video analysis requests globally."""
+    if (
+        request.method == "POST"
+        and request.url.path in ("/analyze/audio", "/analyze/video")
+    ):
+        now = monotonic()
+
+        with _rate_limit_lock:
+            while (
+                _rate_limit_requests
+                and now - _rate_limit_requests[0] >= RATE_LIMIT_WINDOW_SECONDS
+            ):
+                _rate_limit_requests.popleft()
+
+            if len(_rate_limit_requests) >= RATE_LIMIT_MAX_REQUESTS:
+                retry_after = max(
+                    1,
+                    int(
+                        RATE_LIMIT_WINDOW_SECONDS
+                        - (now - _rate_limit_requests[0])
+                    ) + 1,
+                )
+
+                from fastapi.responses import JSONResponse
+
+                return JSONResponse(
+                    status_code=429,
+                    content={
+                        "detail": {
+                            "code": "rate_limit_exceeded",
+                            "message": (
+                                "Too many analysis requests. "
+                                "Please try again later."
+                            ),
+                        }
+                    },
+                    headers={"Retry-After": str(retry_after)},
+                )
+
+            _rate_limit_requests.append(now)
+
+    return await call_next(request)
 
 
 def get_service() -> AudioInferenceService:
@@ -129,6 +184,16 @@ def model_info():
 async def analyze_audio(file: UploadFile = File(...)):
     """Analyze one uploaded audio file without retaining it on disk."""
     service = get_service()
+    if not _inference_request_lock.acquire(blocking=False):
+        await file.close()
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "inference_busy",
+                "message": "Another analysis is in progress. Please try again shortly.",
+            },
+            headers={"Retry-After": "5"},
+        )
 
     filename = Path(file.filename or "upload").name
     suffix = Path(filename).suffix[:12]
@@ -210,14 +275,17 @@ async def analyze_audio(file: UploadFile = File(...)):
             },
         )
     finally:
-        await file.close()
-        if temp_path is not None:
-            try:
-                os.unlink(temp_path)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                logger.warning("Could not remove temporary upload file.")
+        try:
+            await file.close()
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logger.warning("Could not remove temporary upload file.")
+        finally:
+            _inference_request_lock.release()
 
 
 @app.post("/analyze/video")
@@ -235,9 +303,21 @@ async def analyze_video(file: UploadFile = File(...)):
             },
         )
 
+    if not _inference_request_lock.acquire(blocking=False):
+        await file.close()
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "inference_busy",
+                "message": "Another analysis is in progress. Please try again shortly.",
+            },
+            headers={"Retry-After": "5"},
+        )
+
     total_bytes = 0
     try:
         with tempfile.TemporaryDirectory(prefix="aegis_video_") as workdir:
+    
             temp_path = Path(workdir) / ("upload" + suffix)
             with temp_path.open("wb") as temp:
                 while True:
@@ -316,7 +396,10 @@ async def analyze_video(file: UploadFile = File(...)):
             detail={"code": "video_api_error", "message": "The video request could not be processed."},
         )
     finally:
-        await file.close()
+        try:
+            await file.close()
+        finally:
+            _inference_request_lock.release()
 
 
 
